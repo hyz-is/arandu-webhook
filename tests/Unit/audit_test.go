@@ -152,7 +152,7 @@ func TestEveryServiceMethodAuthorizesBeforeTheModel(t *testing.T) {
 	for _, source := range auditedFiles(t) {
 		for _, declaration := range source.file.Decls {
 			function, ok := declaration.(*ast.FuncDecl)
-			if !ok || function.Body == nil || receiverType(function) != "WebhookService" ||
+			if !ok || function.Body == nil || !services[receiverType(function)] ||
 				!function.Name.IsExported() {
 				continue
 			}
@@ -175,13 +175,20 @@ func TestEveryServiceMethodAuthorizesBeforeTheModel(t *testing.T) {
 		}
 	}
 	if audited == 0 {
-		t.Fatal("no exported WebhookService method was found, so this test proved nothing")
+		t.Fatal("no exported service method was found, so this test proved nothing")
 	}
 }
 
-// firstModelReach is where a Service first constructs the generated query or
-// calls a promoted write terminal. Webhooks itself counts: moving only its
-// construction before Authorize is the mutation this audit exists to reject.
+// services are the types whose exported methods are use cases.
+var services = map[string]bool{"EndpointService": true, "CallService": true}
+
+// queries are the generated query constructors.
+var queries = map[string]bool{"Endpoints": true, "Calls": true, "Deliveries": true}
+
+// firstModelReach is where a Service first constructs a generated query or
+// calls a promoted write terminal. The constructor itself counts: moving only
+// its construction before Authorize is the mutation this audit exists to
+// reject.
 func firstModelReach(body *ast.BlockStmt) token.Pos {
 	terminals := map[string]bool{
 		"Save": true, "Delete": true, "Restore": true, "Touch": true,
@@ -193,7 +200,7 @@ func firstModelReach(body *ast.BlockStmt) token.Pos {
 			return true
 		}
 		name := calledName(call)
-		if name != "Webhooks" && !terminals[name] {
+		if !queries[name] && !terminals[name] {
 			return true
 		}
 		if found == token.NoPos || call.Pos() < found {
@@ -258,7 +265,7 @@ func TestTheServiceWritesTenantOnlyFromTheGrant(t *testing.T) {
 	for _, source := range auditedFiles(t) {
 		for _, declaration := range source.file.Decls {
 			function, ok := declaration.(*ast.FuncDecl)
-			if !ok || function.Body == nil || receiverType(function) != "WebhookService" {
+			if !ok || function.Body == nil || !services[receiverType(function)] {
 				continue
 			}
 			ast.Inspect(function.Body, func(node ast.Node) bool {
@@ -428,7 +435,10 @@ func usedCapabilities(files []parsedGoFile) capabilities {
 					name == "http.PostForm", name == "http.NewRequest",
 					name == "http.NewRequestWithContext",
 					name == "net.Dial", name == "net.DialTimeout",
-					strings.HasSuffix(name, ".Do"):
+					strings.HasSuffix(name, ".Do"), strings.HasSuffix(name, ".RoundTrip"),
+					// hesape/webhook's Manager sends the deliveries it is built
+					// for: constructing one is taking on the network.
+					name == "hwebhook.NewManager":
 					used.network = true
 
 				case name == "os.Open", name == "os.OpenFile", name == "os.Create",

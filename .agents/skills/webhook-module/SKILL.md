@@ -1,6 +1,6 @@
 ---
 name: webhook-module
-description: Change what this Arandu package registers — its routes, handlers, configuration, response shape or schema. Use when the request is to "add a route", "add an endpoint", "add a handler", "add a config option", "change the prefix", "add a field to the response", "add a column", "write a migration", "return the tenant id too", "add a background job to the package", "make it run something at boot", "add a scope", "add a rule to the entity", "regenerate the query", "who is the current user in a handler", "return 404", or when a change touches module.go, config.go, model.go or WebhookQuery.go. Covers foundation.Module and the five optional interfaces beside it, why handlers are thin, the RequireAuth guard and ctx.User, returning errors for the router to answer, the generated query and aru model:build, where the rules of the entity live, the migration name that carries the order, and what Resource is for.
+description: Change what this Arandu package registers — its routes, handlers, configuration, response shape or schema. Use when the request is to "add a route", "add an endpoint", "add a handler", "add a config option", "change the prefix", "add a field to the response", "add a column", "write a migration", "return the tenant id too", "add a background job to the package", "make it run something at boot", "add a scope", "add a rule to the entity", "regenerate the query", "who is the current user in a handler", "return 404", or when a change touches module.go, config.go, model.go or EndpointQuery.go. Covers foundation.Module and the five optional interfaces beside it, why handlers are thin, the RequireAuth guard and ctx.User, returning errors for the router to answer, the generated query and aru model:build, where the rules of the entity live, the migration name that carries the order, and what Resource is for.
 license: MIT
 ---
 
@@ -62,9 +62,13 @@ Below the line that is already there, and nowhere above it:
 	r = r.Group("", middleware.RequireAuth(m.sessions))
 ```
 
-That line replaces `r` with the guarded group before the first registration, so
-a route added below it needs a session like every other, and there is no
-unguarded router left in scope to add one to by mistake.
+That line replaces `r` with the guarded group before the first management
+route, so a route added below it needs a session like every other, and there is
+no unguarded router left in scope to add one to by mistake. The receivers are
+the one exception, and they are registered above it on purpose: another system
+calls them with no session, and the signature check in `client.go` is what
+admits a call. `TestHandlersLeaveTheSubjectAndTheStatusToTheFramework` lets a
+route precede the guard only when its path is under `ReceivePrefix`.
 `TestHandlersLeaveTheSubjectAndTheStatusToTheFramework` fails if a route is
 registered before the guard is mounted.
 
@@ -72,7 +76,7 @@ The name is what a URL is built from. Two spellings of one address disagree, and
 the failure when they do is a link to a 404. The prefix is `m.cfg.Prefix` and
 never a literal: the application decides where the package is mounted, and
 `TestTheModuleRegistersItsRoutesUnderItsPrefix` at
-`tests/Feature/routes_test.go:210` mounts it at `/widgets` and fails if any
+`tests/Feature/routes_test.go` mounts it at `/widgets` and fails if any
 route came out anywhere else, or if `everyRoute` does not reach it. It also
 asserts every route is tagged with the module name, which is what
 `aru route:list` groups by.
@@ -101,7 +105,7 @@ what it is handed, so a nil resource panics inside the framework rather than
 answering 204.
 
 No rule and no Model construction lives in a handler. A handler that held the
-database or called `Webhooks` would bypass the only place the Policy is
+database or called `Endpoints` would bypass the only place the Policy is
 guaranteed to run. Read `webhook-policy` before writing the Service method.
 
 **3. Return the error; the router answers it.** The handler writes `return err`
@@ -136,7 +140,7 @@ calls `errors.Is` or `errors.As`, `fhttp.Refuse`, `fhttp.Reject` or
 `http.Error`.
 
 **4. Add the case to the route tests.** `everyRoute` at
-`tests/Feature/routes_test.go:118` is a table of every route.
+`tests/Feature/routes_test.go` is a table of every route.
 `TestAVisitorWithNoSessionIsSentToSignIn` asserts each one sends a request with
 no session to `/auth/login`, and `TestASignedInSubjectReachesThePolicyAndIsRefused`
 asserts each one answers a signed-in administrator 403 from the closed policy.
@@ -160,14 +164,14 @@ to serve without any session is a `security.Guest` the code declares on purpose
 
 ## Changing the Model
 
-`Webhook` embeds `model.Model`, and `webhookTable` declares its table once,
+`Endpoint` embeds `model.Model`, and `endpointTable` declares its table once,
 beside it in `model.go`. Keep the application-generated key and the tenant
 default visible there:
 
 ```go
-var webhookTable = model.NewTable(model.TableSpec{
+var endpointTable = model.NewTable(model.TableSpec{
 	Name:      "webhooks",
-	New:       func() model.Entity { return new(Webhook) },
+	New:       func() model.Entity { return new(Endpoint) },
 	ManualKey: true,
 })
 ```
@@ -178,8 +182,8 @@ package owns tenant data. Model terminals require a Grant and apply `tenant_id`;
 the Service still calls `security.Authorize` first because the Model does not
 decide which Policy action the Grant represents.
 
-`WebhookQuery.go` is generated from that declaration: `Webhooks(db)`, the
-`*WebhookQuery` it returns, and `WebhookCollection`. It is never edited by
+`EndpointQuery.go` is generated from that declaration: `Endpoints(db)`, the
+`*EndpointQuery` it returns, and `EndpointCollection`. It is never edited by
 hand. After changing the struct or the table, run
 
 ```sh
@@ -189,7 +193,7 @@ aru model:build
 and commit what it rewrote. `aru model:build --check` writes nothing and exits 1
 when the file is missing, stale or hand-edited.
 
-Every query starts at `Webhooks(s.db)`. The constructor returns one mutable
+Every query starts at `Endpoints(s.db)`. The constructor returns one mutable
 query, so a second chain begun from a value held in a variable carries the
 clauses of the first — and compiles.
 
@@ -209,10 +213,10 @@ protects come as a pair:
 // arandu:begin custom
 
 // CanRename reports whether the record may take this name.
-func (s Webhook) CanRename(name string) bool { return name != "" && name != s.Name }
+func (s Endpoint) CanRename(name string) bool { return name != "" && name != s.Name }
 
 // Rename gives the record a new name, and refuses one it cannot take.
-func (s *Webhook) Rename(name string) error {
+func (s *Endpoint) Rename(name string) error {
 	if !s.CanRename(name) {
 		return fmt.Errorf("webhook: %q cannot be the new name of this record", name)
 	}
@@ -223,12 +227,12 @@ func (s *Webhook) Rename(name string) error {
 // arandu:end custom
 ```
 
-A local scope is a method on `*WebhookQuery` in the same block, and a relation
-is registered on `webhookTable` from an `init` function:
+A local scope is a method on `*EndpointQuery` in the same block, and a relation
+is registered on `endpointTable` from an `init` function:
 
 ```go
 // Named narrows the query to the records with this name.
-func (q *WebhookQuery) Named(name string) *WebhookQuery {
+func (q *EndpointQuery) Named(name string) *EndpointQuery {
 	return q.Where("name", "=", name)
 }
 ```
@@ -263,15 +267,15 @@ did not get is worse than a number somebody wrote and was told about — that is
 why `PageSize` above `MaxPageSize` is an error and not a silent 200.
 
 Add the case to `TestTheConfigurationRefusesWhatCannotWork` at
-`tests/Unit/policy_test.go:298`, which is a map of named bad configurations, and
-to `TestNewRefusesAWiringThatCannotWork` at `tests/Feature/routes_test.go:267`
+`tests/Unit/policy_test.go`, which is a map of named bad configurations, and
+to `TestNewRefusesAWiringThatCannotWork` at `tests/Feature/routes_test.go`
 if the field can make `New` fail.
 
 ## What may leave in a response
 
 `Resource` and `Collection` in `model.go` are declared snapshots, not direct
 encoding of the entity. This also defines the safe copy boundary: Model-backed
-Service results stay as `*Webhook`/`[]*Webhook`, because a copied row keeps
+Service results stay as `*Endpoint`/`[]*Endpoint`, because a copied row keeps
 the model of the original and refuses to be written. A response snapshot reads
 only the explicit fields and cannot be saved.
 
@@ -311,7 +315,7 @@ func (createWebhooks) GetName() string { return "20260823_0001_create_webhooks" 
 ```
 
 **The name carries the order and nothing else does.** `TestTheModuleDeclaresItsSchema`
-at `tests/Feature/routes_test.go:301` requires the returned names to be sorted,
+at `tests/Feature/routes_test.go` requires the returned names to be sorted,
 requires none to be empty, and requires every one to satisfy
 `migrations.ReversibleMigration` — the migrator finds `Down` by type assertion,
 so a `Down` with the wrong signature is a rollback that silently does nothing.

@@ -40,7 +40,7 @@ package cloned somewhere else never grows a folder tree imitating one.
 
 The audience of the first three is somebody changing the package. The common
 failure modes are a provider, a container lookup, a hand edit to the generated
-`WebhookQuery.go`, a rule of the entity written into the Service instead of the
+`EndpointQuery.go`, a rule of the entity written into the Service instead of the
 custom block of `model.go`, a handler that loads the session or maps an error to
 a status itself, a CRUD Repository beside the Model, a tenant read from the URL,
 or a Policy branch that returns nil for administrators "for now". None belongs

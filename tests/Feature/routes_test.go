@@ -54,6 +54,7 @@ func mount(t *testing.T, cfg webhook.Config) mounted {
 	sessions := security.NewSessionStore([]byte(appKey), time.Hour, false, security.NewMemoryBackend())
 	flash := security.NewFlash([]byte(appKey), false)
 
+	cfg.Key = []byte(appKey)
 	module, err := webhook.New(cfg, data.Wrap(nil, data.DialectSQLite), sessions)
 	if err != nil {
 		t.Fatalf("building the module: %v", err)
@@ -120,10 +121,22 @@ var everyRoute = []struct {
 	target string
 	body   string
 }{
-	{http.MethodGet, webhook.DefaultPrefix, ""},
-	{http.MethodGet, webhook.DefaultPrefix + "/record-1", ""},
-	{http.MethodPost, webhook.DefaultPrefix, "name=one"},
+	{http.MethodGet, webhook.DefaultPrefix + "/endpoints", ""},
+	{http.MethodPost, webhook.DefaultPrefix + "/endpoints", validForm},
+	{http.MethodGet, webhook.DefaultPrefix + "/endpoints/e-1", ""},
+	{http.MethodPut, webhook.DefaultPrefix + "/endpoints/e-1", validForm},
+	{http.MethodDelete, webhook.DefaultPrefix + "/endpoints/e-1", ""},
+	{http.MethodGet, webhook.DefaultPrefix + "/endpoints/e-1/secret", ""},
+	{http.MethodPost, webhook.DefaultPrefix + "/endpoints/e-1/test", ""},
+	{http.MethodGet, webhook.DefaultPrefix + "/endpoints/e-1/deliveries", ""},
+	{http.MethodGet, webhook.DefaultPrefix + "/calls", ""},
+	{http.MethodGet, webhook.DefaultPrefix + "/calls/c-1", ""},
+	{http.MethodPost, webhook.DefaultPrefix + "/calls/c-1/process", ""},
 }
+
+// validForm is an endpoint that passes validation, so the request reaches the
+// policy.
+const validForm = "name=Billing&url=https%3A%2F%2Fexample.com%2Fhooks&events=order.paid&active=1"
 
 func TestAVisitorWithNoSessionIsSentToSignIn(t *testing.T) {
 	t.Parallel()
@@ -172,7 +185,7 @@ func TestARejectedInputGoesBackBeforeTheDatabase(t *testing.T) {
 	// comes from the request and not from the policy. The router answers it the
 	// way it answers every rejected form: back where it came from, with the
 	// messages in the flash -- and it still never reaches a statement.
-	rec := m.answer(t, http.MethodPost, webhook.DefaultPrefix, "name=", cookies...)
+	rec := m.answer(t, http.MethodPost, webhook.DefaultPrefix+"/endpoints", "name=", cookies...)
 	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/" {
 		t.Fatalf("an empty name answered %d to %q, want %d back to /", rec.Code, rec.Header().Get("Location"), http.StatusSeeOther)
 	}
@@ -212,7 +225,7 @@ func TestTheModuleRegistersItsRoutesUnderItsPrefix(t *testing.T) {
 
 	m := mount(t, webhook.Config{Prefix: "/widgets"})
 
-	got := make([]string, 0, 3)
+	got := make([]string, 0, len(everyRoute))
 	for _, route := range m.router.Routes() {
 		if route.Module != "webhook" {
 			t.Errorf("the route %s %s is not tagged with the module name: %q", route.Method, route.Pattern, route.Module)
@@ -221,7 +234,13 @@ func TestTheModuleRegistersItsRoutesUnderItsPrefix(t *testing.T) {
 	}
 	sort.Strings(got)
 
-	want := []string{"GET /widgets", "GET /widgets/{id}", "POST /widgets"}
+	want := []string{
+		"DELETE /widgets/endpoints/{id}",
+		"GET /widgets/calls", "GET /widgets/calls/{id}",
+		"GET /widgets/endpoints", "GET /widgets/endpoints/{id}", "GET /widgets/endpoints/{id}/deliveries", "GET /widgets/endpoints/{id}/secret",
+		"POST /widgets/calls/{id}/process", "POST /widgets/endpoints", "POST /widgets/endpoints/{id}/test",
+		"PUT /widgets/endpoints/{id}",
+	}
 	if len(got) != len(want) || len(got) != len(everyRoute) {
 		t.Fatalf("registered %v, want %v, and everyRoute reaches %d of them", got, want, len(everyRoute))
 	}
@@ -269,19 +288,35 @@ func TestNewRefusesAWiringThatCannotWork(t *testing.T) {
 
 	sessions := security.NewSessionStore([]byte(appKey), time.Hour, false, security.NewMemoryBackend())
 	handle := data.Wrap(nil, data.DialectSQLite)
-	valid := webhook.Config{}
+	valid := webhook.Config{Key: []byte(appKey)}
 
-	if _, err := webhook.New(webhook.Config{PageSize: -1}, handle, sessions); err == nil {
+	if _, err := webhook.New(webhook.Config{Key: []byte(appKey), PageSize: -1}, handle, sessions); err == nil {
 		t.Error("a configuration with a negative page size was accepted")
+	}
+	if _, err := webhook.New(webhook.Config{}, handle, sessions); err == nil {
+		t.Error("a configuration with no key was accepted")
 	}
 	if _, err := webhook.New(valid, nil, sessions); err == nil {
 		t.Error("a nil database handle was accepted")
 	}
-	if _, err := webhook.New(valid, handle, nil); err == nil {
-		t.Error("a nil session store was accepted")
-	}
 	if _, err := webhook.New(valid, handle, sessions); err != nil {
 		t.Fatalf("a valid wiring was refused: %v", err)
+	}
+
+	// With no session store the module mounts its receivers and no
+	// management route.
+	module, err := webhook.New(webhook.Config{Key: []byte(appKey), Receivers: []webhook.Receiver{{
+		Name: "billing", Tenant: "acme", Secret: appKey,
+		Process: webhook.ProcessorFunc(func(context.Context, security.Grant, *webhook.Call) error { return nil }),
+	}}}, handle, nil)
+	if err != nil {
+		t.Fatalf("a wiring with no session store was refused: %v", err)
+	}
+	router := fhttp.NewRouter()
+	module.Routes(router.ForModule(module.Name()))
+	routes := router.Routes()
+	if len(routes) != 1 || routes[0].Pattern != "/webhooks/billing" || routes[0].Method != http.MethodPost {
+		t.Fatalf("with no session store the module registered %v", routes)
 	}
 }
 
@@ -292,7 +327,7 @@ func TestNewRefusesARoutePrefixThatCannotBeRegistered(t *testing.T) {
 	handle := data.Wrap(nil, data.DialectSQLite)
 
 	for _, prefix := range []string{"/widgets{", "/widgets/{id}"} {
-		if _, err := webhook.New(webhook.Config{Prefix: prefix}, handle, sessions); err == nil {
+		if _, err := webhook.New(webhook.Config{Key: []byte(appKey), Prefix: prefix}, handle, sessions); err == nil {
 			t.Errorf("New accepted route prefix %q, which would panic during route registration", prefix)
 		}
 	}
@@ -302,7 +337,7 @@ func TestTheModuleDeclaresItsSchema(t *testing.T) {
 	t.Parallel()
 
 	sessions := security.NewSessionStore([]byte(appKey), time.Hour, false, security.NewMemoryBackend())
-	module, err := webhook.New(webhook.Config{}, data.Wrap(nil, data.DialectSQLite), sessions)
+	module, err := webhook.New(webhook.Config{Key: []byte(appKey)}, data.Wrap(nil, data.DialectSQLite), sessions)
 	if err != nil {
 		t.Fatalf("building the module: %v", err)
 	}

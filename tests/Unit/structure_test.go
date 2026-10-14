@@ -112,27 +112,41 @@ func TestThePackageUsesTheGeneratedConcreteModel(t *testing.T) {
 	wants := map[string][]string{
 		"model.go": {
 			`"github.com/arandu-io/hesape/database/model"`,
-			"type Webhook struct {\n\tmodel.Model\n",
-			"var webhookTable = model.NewTable(model.TableSpec{",
+			"type Endpoint struct {\n\tmodel.Model\n",
+			"type Call struct {\n\tmodel.Model\n",
+			"type Delivery struct {\n\tmodel.Model\n",
+			"var endpointTable = model.NewTable(model.TableSpec{",
+			"var callTable = model.NewTable(model.TableSpec{",
+			"var deliveryTable = model.NewTable(model.TableSpec{",
 			"ManualKey: true,",
 			"// arandu:begin custom\n",
 			"// arandu:end custom\n",
 		},
-		"WebhookQuery.go": {
+		"EndpointQuery.go": {
 			generatedHeading,
-			"func Webhooks(db model.DB) *WebhookQuery",
-			"type WebhookCollection []*Webhook",
+			"func Endpoints(db model.DB) *EndpointQuery",
+			"type EndpointCollection []*Endpoint",
+		},
+		"CallQuery.go": {
+			generatedHeading,
+			"func Calls(db model.DB) *CallQuery",
+			"type CallCollection []*Call",
+		},
+		"DeliveryQuery.go": {
+			generatedHeading,
+			"func Deliveries(db model.DB) *DeliveryQuery",
 		},
 		"service.go": {
 			"db     *data.DB",
-			"func NewWebhookService(db *data.DB) *WebhookService",
-			"Webhooks(s.db).New()",
-			"Webhooks(s.db).WhereKey(",
-			") (*Webhook, error)",
-			") ([]*Webhook, error)",
+			"Endpoints(s.db).New()",
+			"Endpoints(s.db).WhereKey(",
+			"Calls(s.db).WhereKey(",
+			") (*Endpoint, error)",
+			") ([]*Call, error)",
 		},
 		"module.go": {
-			"NewWebhookService(db)",
+			"newEndpointService(db, s)",
+			"newCallService(db, c)",
 		},
 	}
 	for path, required := range wants {
@@ -172,8 +186,8 @@ func TestThePackageUsesTheGeneratedConcreteModel(t *testing.T) {
 				t.Errorf("%s still spells the generic model layer %q", filepath.ToSlash(relative), stale)
 			}
 		}
-		if relative != "WebhookQuery.go" && strings.Contains(string(body), generatedHeading) {
-			t.Errorf("%s carries the heading of the generated query, which only WebhookQuery.go may", filepath.ToSlash(relative))
+		if !strings.HasSuffix(relative, "Query.go") && strings.Contains(string(body), generatedHeading) {
+			t.Errorf("%s carries the heading of the generated query, which only a *Query.go file may", filepath.ToSlash(relative))
 		}
 		return nil
 	})
@@ -191,13 +205,13 @@ func TestTheGuidesTeachTheGeneratedModelBoundary(t *testing.T) {
 
 	root := packageRoot(t)
 	guides := map[string][]string{
-		"AGENTS.md":                               {"Webhooks(db)", "security.Authorize"},
-		"README.md":                               {"Webhooks(db)", "WebhookQuery", "aru model:build", "RequireAuth"},
-		"CONTRIBUTING.md":                         {"Webhooks(db)", "authorizes before reaching the Model", "aru model:build"},
+		"AGENTS.md":                               {"Endpoints(db)", "security.Authorize"},
+		"README.md":                               {"Endpoints(db)", "EndpointQuery", "aru model:build", "RequireAuth"},
+		"CONTRIBUTING.md":                         {"Endpoints(db)", "authorizes before reaching the Model", "aru model:build"},
 		"SECURITY.md":                             {"Model terminal", "data.Tenant(g)"},
-		".agents/skills/README.md":                {"WebhookQuery", "custom block"},
-		".agents/skills/webhook-module/SKILL.md":  {"webhookTable", "ctx.User()", "RequireAuth", "return err"},
-		".agents/skills/webhook-policy/SKILL.md":  {"security.Authorize", "Webhooks(s.db).New()"},
+		".agents/skills/README.md":                {"EndpointQuery", "custom block"},
+		".agents/skills/webhook-module/SKILL.md":  {"endpointTable", "ctx.User()", "RequireAuth", "return err"},
+		".agents/skills/webhook-policy/SKILL.md":  {"security.Authorize", "Endpoints(s.db).New()"},
 		".agents/skills/webhook-release/SKILL.md": {"model:build --check", "configured copy"},
 		".agents/skills/webhook-package/SKILL.md": {"RequireAuth", "/auth/login"},
 	}
@@ -257,8 +271,11 @@ func TestHandlersLeaveTheSubjectAndTheStatusToTheFramework(t *testing.T) {
 		t.Fatal("Module has no Routes method")
 	}
 
-	// The guard is mounted on the router before the first route is registered
-	// on it, so no route of this package is reachable without a session.
+	// The guard is mounted on the router before the first management route is
+	// registered on it, so none is reachable without a session. A receiver is
+	// the one route that precedes it: another system calls it with no session,
+	// and its signature admits it. It is recognised by its path, under
+	// ReceivePrefix, and by nothing a later route could copy by accident.
 	guarded, registered := token.NoPos, token.NoPos
 	ast.Inspect(routes.Body, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
@@ -268,7 +285,7 @@ func TestHandlersLeaveTheSubjectAndTheStatusToTheFramework(t *testing.T) {
 		switch name := selectorName(call.Fun); {
 		case name == "RequireAuth" && guarded == token.NoPos:
 			guarded = call.Pos()
-		case routeVerbs[name] && registered == token.NoPos:
+		case routeVerbs[name] && registered == token.NoPos && !mentions(call, "ReceivePrefix"):
 			registered = call.Pos()
 		}
 		return true
@@ -332,6 +349,20 @@ func TestHandlersLeaveTheSubjectAndTheStatusToTheFramework(t *testing.T) {
 			t.Errorf("Module.%s does not read who is asking with ctx.User", name)
 		}
 	}
+}
+
+// mentions reports whether any argument of the call names the selector.
+func mentions(call *ast.CallExpr, name string) bool {
+	found := false
+	for _, argument := range call.Args {
+		ast.Inspect(argument, func(node ast.Node) bool {
+			if selector, ok := node.(*ast.SelectorExpr); ok && selector.Sel.Name == name {
+				found = true
+			}
+			return !found
+		})
+	}
+	return found
 }
 
 // routeVerbs are the router methods that register a route, as distinct from the

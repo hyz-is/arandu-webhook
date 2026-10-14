@@ -10,12 +10,14 @@ framework = ">= 0.56"
 profiles = ["conventional", "performance"]
 
 [permissions]
-# It answers requests and reads its own rows. Nothing leaves the process.
-network = false
+# It sends webhooks: the deliveries leave the process through hesape/webhook's
+# Manager, on a transport that refuses private and loopback addresses.
+network = true
 # It keeps no state outside the database.
 filesystem = false
 # It runs no other program.
 exec = false
-# module.go owns the webhooks table, so whoever installs this has to run
-# `aru migrate`. Declaring it is how they find that out before deploying.
+# module.go owns the webhook_server_endpoints and webhook_client_calls tables,
+# and returns hesape/webhook's webhook_deliveries migration, so whoever
+# installs this has to run `aru migrate`.
 migrations = true

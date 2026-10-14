@@ -38,7 +38,7 @@ project: no go.mod, main.go and arandu.toml together"* — it reads applications
 and this is a library.
 
 `aru model:build` is different: it works on a module root, and it is what wrote
-`WebhookQuery.go`. Run it after any change to the entity, and before a release
+`EndpointQuery.go`. Run it after any change to the entity, and before a release
 
 ```sh
 aru model:build --check
@@ -143,8 +143,8 @@ it is, and what they have to write instead.
 Run `apidiff` against the release baseline and enumerate every removal; the CI
 step named `api diff against the last release` fails unless `UPGRADE.md` names
 each one. A move to a new shape of the model breaks more than its own
-signatures: `Webhooks` changing what it returns is one line, and every method
-the old embedded model promoted on `*Webhook` that the new one does not is
+signatures: `Endpoints` changing what it returns is one line, and every method
+the old embedded model promoted on `*Endpoint` that the new one does not is
 another, each named on its own. Keeping `ErrNotFound` in `model.go` is not a
 removal just because its value changed.
 

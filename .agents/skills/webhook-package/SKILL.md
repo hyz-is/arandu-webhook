@@ -1,6 +1,6 @@
 ---
 name: webhook-package
-description: Install, wire and use the Arandu Webhook package (Go, Arandu) in an application. Use when the request is to "install Arandu Webhook", "add webhook to the app", "go get github.com/hyz-is/arandu-webhook", "wire it into bootstrap/app.go", "register the module", "use the webhook routes", "everything under /webhook returns 403", "403 forbidden from webhook", "it redirects to /auth/login", "the table does not exist", "no such table", "change where it is mounted", "let admins read it", or when a project's go.mod already requires github.com/hyz-is/arandu-webhook. Covers the three lines of wiring and where each one goes, the Config fields, none of them required, the routes, their names and the session they need, why the policy refuses everything until somebody opens it, and the migration step that is not optional.
+description: Install, wire and use the Arandu Webhook package (Go, Arandu) in an application, to send webhooks to endpoints and to receive them from other systems. Use when the request is to "install Arandu Webhook", "send webhooks", "receive a webhook", "add a webhook endpoint", "verify a webhook signature", "replace spatie webhook-server or webhook-client", "go get github.com/hyz-is/arandu-webhook", "wire it into bootstrap/app.go", "the receiver answers 403", "the receiver answers 419", "deliveries never leave", "the call is stored but never processed", "everything under /webhook returns 403", "it redirects to /auth/login", "no such table", or when a project's go.mod already requires github.com/hyz-is/arandu-webhook. Covers the wiring in bootstrap/app.go, the CSRF exemption, the relay and the worker, the Config, Server and Receiver fields, the routes, the actions, and the migration step that is not optional.
 license: MIT
 metadata:
   audience: app
@@ -8,23 +8,19 @@ metadata:
 
 # Using Arandu Webhook
 
-An Arandu package with one entity, its own table, its own routes and its own
-policy. It is registered by hand — there is no service provider, no container
-and no discovery, so if a line is not written in the application, it does not
-happen.
+Webhooks both ways: endpoints a tenant sends events to, delivered through
+hesape/webhook's Manager, and receivers other systems call, whose calls are
+stored and processed on the queue. It is registered by hand — there is no
+service provider, no container and no discovery, so if a line is not written in
+the application, it does not happen.
 
 ## Install
 
 ```bash
-go get github.com/hyz-is/arandu-webhook
+go get github.com/hyz-is/arandu-webhook@v0.1.0
 ```
 
-## The three lines of wiring, and where each one goes
-
-All three are in `bootstrap/app.go`. Nothing else in the application changes,
-and `aru make:module` does not edit this file for you.
-
-The import, with the other module imports:
+## The wiring, all of it in bootstrap/app.go
 
 ```go
 import (
@@ -32,26 +28,38 @@ import (
 )
 ```
 
-The construction, in `Build`, after the session store exists and before
-`k.Register`:
-
 ```go
-	webhookModule, err := webhook.New(webhook.Config{}, db, sessions)
+	webhookModule, err := webhook.New(webhook.Config{
+		Key: fw.App.Key,
+		Server: webhook.Server{Events: []string{"order.paid"}},
+		Receivers: []webhook.Receiver{{
+			Name: "billing", Tenant: tenant, Secret: billingSecret, Process: billingProcessor,
+		}},
+	}, db, sessions)
 	if err != nil {
 		return App{}, err
 	}
 ```
 
-And the registration, inside the `k.Register(...)` call already there:
-
 ```go
+	k.Register(
+		// ...
 		webhookModule,
+	)
 ```
 
-`New` returns an error rather than starting half-wired. It refuses a
-configuration that cannot work, a nil database handle and a nil session store,
-so a wiring mistake costs one restart instead of arriving as a nil dereference
-on the first request that needed it.
+Three more lines, each where the thing it touches is built:
+
+| where | line | without it |
+| --- | --- | --- |
+| the CSRF middleware | `middleware.CSRFExcept(webhookModule.ReceivePrefix()+"/")` | every receiver answers 419 |
+| the events relay | `webhookModule.Publisher()` among the relay's publishers | events reach no endpoint |
+| the worker command | `webhookModule.RegisterJobHandlers(worker)` | deliveries and received calls wait forever |
+
+`New` returns an error rather than starting half-wired: a missing or short
+`Key`, a nil database handle, a receiver with no tenant, secret or processor, a
+prefix that cannot be a route. A nil session store is allowed and mounts no
+management route.
 
 ## Then run the migrations
 
@@ -59,126 +67,46 @@ on the first request that needed it.
 aru migrate
 ```
 
-Not optional, and not automatic. The package owns a table, which is why its
-`arandu.mod.toml` declares `migrations = true` — that declaration is how an
-installer finds out before deploying rather than from the first request.
-
-`aru migrate` is a step in the pipeline and never a call at the start of the
-process: with N replicas, N migrations race each other.
-
-**Symptom to recognise:** `no such table`, or `relation does not exist`, from a
-route that authorized correctly. The migration has not run.
+Not optional, and not automatic: `webhook_server_endpoints`,
+`webhook_client_calls`, and hesape/webhook's `webhook_deliveries`. The jobs
+table is the queue's. **Symptom:** `no such table` from a route that authorized
+correctly.
 
 ## Configuration
 
-| field | required | meaning |
-| --- | --- | --- |
-| `Prefix` | no | where the routes are mounted. Defaults to `/webhook` |
-| `PageSize` | no | how many records one page answers with. Defaults to 25, refused above 200 |
+| field | meaning |
+| --- | --- |
+| `Key` | required: the application's key; the endpoints' secrets and headers are sealed with a key derived from it |
+| `Prefix` | the management routes, `/webhook` by default |
+| `ReceivePrefix` | the receivers, `/webhooks` by default |
+| `PageSize` | a page of the listings, 25 by default, refused above 200 |
+| `Server.Events` | the events an endpoint may subscribe to; empty accepts any name |
+| `Server.HeaderPrefix` | renames `X-Arandu-` on the deliveries |
+| `Server.Secrets` | named secrets for `Outgoing` calls, 32 bytes or more |
+| `Server.Queue`, `UserAgent`, `Timeout`, `Retention`, `HTTPClient` | the Manager underneath |
+| `Receivers` | one per system that calls the application |
+| `DeleteAfterDays`, `CleanSpec` | the clean of received calls, 30 days, daily at 03:20 |
 
-`webhook.Config{}` is a complete configuration. There is no tenant to pass:
-every route needs a session, and the tenant of every statement comes from
-`data.Tenant(g)`, off the Grant of whoever is signed in. Passing a value the
-request named — a path segment, a header, a subdomain read off the URL — is what
-`TestNoTenantIsReadOutOfTheRequest` fails on in the package. In an application
-the same mistake is `aru doctor`'s `tenant-from-request`; in a package nothing
-but the package's own suite looks.
-
-`PageSize` above 200 is an error from `New`, not a silent 200. A number somebody
-wrote and did not get is worse than a number somebody wrote and was told about.
+A receiver's `Tenant` is whose calls these are, from the application's
+configuration. Nothing in a request chooses it: the signature admits the call,
+and the tenant is the receiver's.
 
 ## Routes
 
-| method | path | name |
-| --- | --- | --- |
-| `GET` | `/webhook` | `webhook.index` |
-| `GET` | `/webhook/{id}` | `webhook.show` |
-| `POST` | `/webhook` | `webhook.store` |
+The management routes sit behind `RequireAuth`, mounted by the package itself.
+A request with no session is sent to `/auth/login`. They answer JSON, and the
+README lists them. The receivers, `POST /webhooks/{name}`, need no session.
 
-Every route sits behind `RequireAuth`, mounted by the package itself. A request
-with no session is sent to `/auth/login` — 303, or `HX-Redirect` for an htmx
-request — and comes back to the address it asked for after signing in. That is
-the sign-in screen the starter kit publishes; an application without one sees
-a 404 there.
+**Symptom:** a receiver answers 403. The signature did not check: the secret, the
+header name (`HMAC{Header: …}`), a prefix such as `sha256=` (`HMAC{Prefix: …}`),
+or a body changed by a proxy. `OnInvalidSignature` is where to log it.
 
-**Symptom to recognise:** every route of the package redirects to
-`/auth/login`. Nobody is signed in on that request: the session cookie did not
-arrive, or the session store passed to `New` is not the one the application
-signs people in with.
+**Symptom:** a call is stored with status `received` and stays there. No worker
+runs the `webhooks` queue, or `RegisterJobHandlers` was not called on it.
 
-Build URLs from the names, never by writing the path a second time. `aru
-route:list` shows them grouped by module. Under a custom `Prefix` the paths move
-and the names do not.
+## Who may do what
 
-`GET /webhook` answers `{"data": {"items": [...]}}`, and adds
-`"next_cursor"` beside `data` when a further page exists. Pass it back as
-`?cursor=`. A page shorter than `PageSize` is the last one and carries no
-cursor.
-
-`TenantID` is not in any response. That is deliberate: it names a customer's
-identifier and the response is a declared list of fields rather than the entity.
-
-## Every route refuses everybody, until you open the policy
-
-This is the state the package ships in, and it is not a bug to work around.
-`WebhookPolicy` denies every action and has no branch that allows one:
-
-```
-403 Forbidden
-```
-
-is what a correctly installed, correctly migrated, correctly wired package
-answers to an administrator who is signed in, on day one.
-
-Opening an action means writing the rule that opens it, in the package's
-`policy.go`, inside the block that says so:
-
-```go
-	// arandu:begin custom
-	if a == WebhookView && (s.ID == record.ID || s.HasRole("admin")) {
-		return nil
-	}
-	// arandu:end custom
-```
-
-What is not written there stays closed, including every action added later.
-There are five actions — `WebhookView`, `WebhookList`, `WebhookCreate`,
-`WebhookUpdate`, `WebhookDelete` — and opening one opens exactly one.
-
-**Do not open it from the application.** There is no hook, no override and no
-config flag for the policy, and adding one would be a second place where
-authorization is decided. If the rules this application needs are not the rules
-the package ships, the change belongs in the package.
-
-## What the answers mean
-
-| status | what happened |
-| --- | --- |
-| `303` to `/auth/login` | there is no session on the request |
-| `403` | the policy refused, or no rule allows the action yet |
-| `404` | no row with that id in this tenant |
-| `303` back to the page the request came from | the input was rejected; the messages and what was typed are in the flash |
-| `422` `application/problem+json` | the input was rejected and the request asked for JSON; the messages are in `errors`, keyed by field |
-
-A request that asks for JSON (an `Accept` naming `application/json`, or an XHR
-that is not htmx) gets the 403 and the 404 as problem documents too. The
-sign-in redirect is the same for every client.
-
-The package does not choose these: its handlers return what the service
-returned, and the framework's router answers it. A refusal carries no detail
-beyond the status and its standard sentence. Telling a client why a policy said
-no tells it what exists and what does not, one request at a time. The reason is
-in the log.
-
-Anything else is a 500 and the framework's error page in development. The
-package returns unexpected errors rather than swallowing them, so a route that
-answers 200 with an empty body is not something it does.
-
-## Reporting a problem
-
-Issues and pull requests go to the repository the module path names,
-`github.com/hyz-is/arandu-webhook`, which belongs to `hyz-is`. A vulnerability goes to the
-private advisory form named in that repository's `SECURITY.md`, and never into
-an issue.
-
-MIT licensed. Copyright Paulo R. Lima.
+The policies allow an action to a subject that carries it, in its own tenant.
+Give the people who manage webhooks the actions of `webhook.Actions()` through
+arandu-permission. **Symptom:** every management route answers 403 for a
+signed-in administrator. The subject has roles and none of the actions.

@@ -6,10 +6,13 @@ license: MIT
 
 # Opening the policy
 
-The package ships denying every action, and that is the state to start from
-rather than a placeholder to delete. There is no permit-all branch to remove,
-and adding one is the single change that would make every application installing
-this package unsafe while looking like working code.
+The two policies allow an action only to a subject that carries it -- the
+actions of `Actions()`, which arandu-permission puts on the Subject -- in the
+subject's own tenant, and never to a guest. Everything else is refused, and
+`CallReceive` and `CallClean` are refused to every subject: they exist only in
+the Grants the receiver and the scheduled clean issue for themselves. There is
+no permit-all branch, and adding one is the single change that would make every
+application installing this package unsafe while looking like working code.
 
 ## How a request actually gets through
 
@@ -19,7 +22,7 @@ Four things happen, in this order, and each one is a different file.
 2. `service.go` calls `security.Authorize(ctx, s.policy, actor, ACTION, record)`.
 3. `policy.go` `Can` returns nil, or the reason it will not.
 4. Only then does a `security.Grant` exist, and `service.go` reaches
-   `Webhooks(s.db)` and a Model terminal with it.
+   `Endpoints(s.db)` and a Model terminal with it.
 
 The Grant is the mechanism, and it is worth knowing exactly how much it
 guarantees. `Authorize` is the only function in the framework that returns a
@@ -30,11 +33,17 @@ job, a scheduled task — and in an application's own code `aru doctor` reports 
 as `system-grant-outside-scope` when it appears in a handler, and
 `system-grant-without-tenant` when it is called with an empty tenant. A lint,
 not the type system, and one that never runs over an installed package. Nothing
-here reports it either. Do not reach for it in this package.
+here reports it either. This package reaches for it in four places, each with an
+`//arandu:system-grant` comment that says why: storing a received call, whose
+signature checked against the secret the application configured and whose
+tenant is the Receiver's; queueing its processing in that same tenant; the
+scheduled clean, in the tenants the Receivers name; and the test call, after
+`EndpointPolicy` authorized it, under hesape's dispatch action. Add a fifth only
+with the same kind of reason, written beside it.
 
 The Model requires a Grant and applies its tenant, but it does not decide which
 Policy action that Grant represents. `security.Authorize` before the first
-`Webhooks(s.db)` call is therefore mandatory even though the terminal itself
+`Endpoints(s.db)` call is therefore mandatory even though the terminal itself
 also takes `g`.
 
 ## The procedure
@@ -45,7 +54,7 @@ also takes `g`.
 
 ```go
 	// arandu:begin custom
-	if a == WebhookView && (s.ID == record.ID || s.HasRole("admin")) {
+	if a == EndpointView && (s.ID == record.ID || s.HasRole("admin")) {
 		return nil
 	}
 	// arandu:end custom
@@ -68,30 +77,31 @@ subject that arrives with an empty `ID` and is still authorized at all. The zero
 `Subject` — an empty `ID` with no guest marker — is refused by `Authorize`
 before `Can` is consulted, because it is almost always a session that failed to
 load, and a policy asked about nobody answers about nobody.
-`TestAuthorizeRefusesASubjectThatIsNobody` at `tests/Unit/policy_test.go:94`
-holds that apart from the guest case, and `TestThePolicyDeniesAGuest:82` proves
+`TestAuthorizeRefusesASubjectThatIsNobody`
+holds that apart from the guest case, and `TestThePoliciesDenyAGuest` proves
 a guest is refused until somebody writes a rule for one.
 
 **3. Leave the tenant check above the block alone.**
 
 ```go
 	if record.ID != "" && record.TenantID != s.Tenant {
-		return fmt.Errorf("webhook belongs to another tenant")
+		return fmt.Errorf("endpoint belongs to another tenant")
 	}
 ```
 
 It runs before every rule, and it is the one refusal that has to survive
 somebody opening the actions below it: a rule allowing an owner to read their
 own record allows it across customers as soon as two customers have a record
-with the same identifier. `TestThePolicyDeniesARecordOfAnotherTenant:65` asserts
+with the same identifier. `TestThePoliciesDenyARecordOfAnotherTenant` asserts
 the message contains `another tenant`, so the sentence is part of the contract.
 The empty `ID` is exempt because it is the candidate that has not been stored
 yet, and it belongs to nobody until it is written with the tenant off the Grant.
 
-**4. Add the action to the test list if you added an action.** `everyAction` at
-`tests/Unit/policy_test.go:34` is the whole set the default-deny tests walk. A
-list holding four of five passes while the fifth is open, which is the only
-state in which any of this matters.
+**4. Add the action to the test list if you added an action.** `endpointActions`
+and `callActions` in `tests/Unit/policy_test.go` are the whole set the tests
+walk, and `Actions()` is what arandu-permission offers. A list holding four of
+five passes while the fifth is open, which is the only state in which any of
+this matters.
 
 **5. Run the gates.**
 
@@ -103,25 +113,25 @@ gofmt -l $(find . -name '*.go' -not -path '*/testdata/*' -not -name '*.kyse.go')
 
 The default-deny tests will now fail for the action you opened, and that is the
 suite doing its job. Change them to assert the rule you wrote — which subject is
-allowed, which is still refused — rather than removing the action from
-`everyAction`.
+allowed, which is still refused — rather than removing the action from the
+list.
 
 ## Adding a Model-backed service method
 
-`WebhookService` owns `db *data.DB`. Validate first, build the value the Policy
-must see, call `security.Authorize`, and only then call `Webhooks(s.db)`.
+`EndpointService` owns `db *data.DB`. Validate first, build the value the Policy
+must see, call `security.Authorize`, and only then call `Endpoints(s.db)`.
 `TestEveryServiceMethodAuthorizesBeforeTheModel` reads every exported Service
 method and refuses the opposite order; the runtime twin uses a nil database so
 even constructing the query early fails.
 
-Create builds the row with `Webhooks(s.db).New()`, keeps its pointer, fills it
+Create builds the row with `Endpoints(s.db).New()`, keeps its pointer, fills it
 field by field, writes `TenantID` from `data.Tenant(g)`, and calls
 `Save(ctx, g)`. Find and Get return pointers too. A copy of a row keeps the model
 of the original, and the model refuses to write through it with
 `model.ErrUnwired`; assigning a whole struct over a row from `New()` does the
 same to the row.
 
-Every query starts at `Webhooks(s.db)`. The constructor returns one mutable
+Every query starts at `Endpoints(s.db)`. The constructor returns one mutable
 query, so a second chain begun from a value held in a variable carries the
 clauses of the first.
 
@@ -151,9 +161,9 @@ customers with a technical name.
 people delete:
 
 ```go
-	g, err := security.Authorize(ctx, s.policy, actor, WebhookView, Webhook{})
-	record, err := Webhooks(s.db).WhereKey(id).First(ctx, g)
-	_, err = security.Authorize(ctx, s.policy, actor, WebhookView, *record)
+	g, err := security.Authorize(ctx, s.policy, actor, EndpointView, Endpoint{})
+	record, err := Endpoints(s.db).WhereKey(id).First(ctx, g)
+	_, err = security.Authorize(ctx, s.policy, actor, EndpointView, *record)
 ```
 
 The first call sees an empty value, so every rule about the record itself —
@@ -168,7 +178,7 @@ A policy call per record would be one call per row of a page and would still not
 narrow the query — a listing that has to read a customer's rows in order to
 decide it may not read them has already read them. **A rule that hides
 individual records from a listing belongs in the query, as a predicate**,
-beside the tenant filter — a scope on `*WebhookQuery` when more than one use
+beside the tenant filter — a scope on `*EndpointQuery` when more than one use
 case needs it. The action decides whether the listing runs at all.
 
 ## Three shapes that look like authorization and are not
