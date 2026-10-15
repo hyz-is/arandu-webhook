@@ -10,6 +10,15 @@ a release is corrected by another release and never by moving a tag.
 
 ## [Unreleased]
 
+### Fixed
+
+- The module requires hesape v0.56.0 instead of v0.58.0. v0.1.0 raised every
+  installer to hesape v0.58.0, with which framework v0.56.0's `framework/view`
+  does not compile (it converts hesape's `view.Page`, which v0.57.0 widened).
+  The module uses nothing newer than v0.56.0, and a feature test now compiles
+  it beside `framework/view` so the floor cannot rise past the framework's
+  again.
+
 ## [0.1.0] - 2026-10-14
 
 The first release: spatie/laravel-webhook-server and laravel-webhook-client for

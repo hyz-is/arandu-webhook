@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+The module requires hesape v0.56.0, not v0.58.0. An application that went to
+hesape v0.58.0 only because of this module can go back with
+`go get github.com/arandu-io/hesape@v0.56.0`, which is what framework v0.56.0's
+`framework/view` compiles against.
+
 ## v0.1.0
 
 The first release. Install it with hesape v0.58.0 or newer, wire it in

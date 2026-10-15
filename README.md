@@ -79,7 +79,10 @@ are in Laravel.
 go get github.com/hyz-is/arandu-webhook@v0.1.0
 ```
 
-It needs framework v0.56 and hesape v0.58.
+It needs framework v0.56 and hesape v0.56. It requires no hesape newer than
+the one framework v0.56 is built against, because `framework/view` converts
+hesape's `view.Page` to its own and stops compiling with hesape v0.57 or newer:
+keep hesape at v0.56 in an application that draws pages with it.
 
 ## Wire it
 
