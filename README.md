@@ -88,7 +88,7 @@ are in Laravel.
 ## Install
 
 ```bash
-go get github.com/hyz-is/arandu-webhook@v0.3.0
+go get github.com/hyz-is/arandu-webhook@v0.4.0
 ```
 
 It needs framework v0.56 and hesape v0.56. It requires no hesape newer than
@@ -299,14 +299,23 @@ characters of the answer and its duration.
 same body, under a new timestamp and signature. A delivery with no attempt left
 is given one more; one whose attempt is in progress is refused with 409.
 
-An endpoint turned off -- by a person with `Disable`, or by the engine after
-`DisableAfter` deliveries in a row gave up -- keeps its deliveries waiting;
-`Enable`, or an `Update` that turns it on, sends them and clears the count, and
-a delivered one resets the count too. A redelivery and a
-test go whatever the endpoint's state. The deliveries of a deleted endpoint
-fail as `endpoint_deleted`. Settled deliveries and their attempts are removed
-after `Server.Retention`, 30 days by default, by the scheduled
-`webhook.deliveries.clean`.
+An endpoint turned off -- by a person with `Disable`, or `DisableWithReason`
+to keep why, or by the engine after `DisableAfter` deliveries in a row gave up
+(`DisabledByFailures`) -- keeps its deliveries waiting; `Enable`, or an
+`Update` that turns it on, sends them and clears the count, and a delivered one
+resets the count too. A redelivery and a test go whatever the endpoint's state.
+The deliveries of a deleted endpoint fail as `endpoint_deleted`.
+
+An endpoint subscribes to at least one event, unless
+`Server.AllowEmptySubscription` lets it subscribe to none: the events outbox
+then sends it nothing, and `Send`, the test call and a redelivery still reach
+it.
+
+Settled deliveries and their attempts are removed after `Server.Retention`, 30
+days by default, by the scheduled `webhook.deliveries.clean`, and received calls
+after `DeleteAfterDays` by `webhook.calls.clean`. Each is one pass over every
+tenant with rows in its table -- a platform tenant no scheduler lists included
+-- each tenant under a Grant of its own.
 
 ### Rotating a secret
 
@@ -339,7 +348,9 @@ _, err := webhookModule.EndpointService().Import(ctx, migrationSubject, webhook.
 The secrets are sealed with this module's key, bound to the tenant and the id.
 `EndpointImport` is the data migration's action: `Actions()` does not offer it,
 and the subject the migration runs as carries it. Previous secrets already
-retired are dropped, and at most `MaxPreviousSecrets` (5) are kept.
+retired are dropped, and at most `MaxPreviousSecrets` (5) are kept. The
+endpoint's history comes along: `CreatedAt`, `ConsecutiveFailures`, and
+`DisabledAt` with `DisabledReason` for one that was turned off.
 
 ## Receiving
 
@@ -445,6 +456,18 @@ the queue.
 | a body that cannot be read | `BadRequest` | 400 |
 | a resolver that cannot answer | `Unavailable` | 503 |
 | a `ProcessSync` error | `Failed` | 500 |
+
+Every call keeps who connected (`Call.RemoteAddr`) and `Call.HeadersSHA256`,
+the `HeadersDigest` of every header it arrived with, whatever `StoreHeaders`
+keeps. A `SyncProcessor` also reads every header of the request with
+`Call.ReceivedHeaders`; a processor on the queue reads the call back from its
+table, with the headers `StoreHeaders` kept and the digest.
+
+The address a call arrived at is kept as `Receiver.URL` says. By default a
+receiver whose route has a path parameter keeps only the route --
+`https://host/webhooks/cielo/{token}`, no query -- because the parameter is
+often a bearer token, and any other receiver keeps the whole address.
+`URLFull` keeps it whole, `URLNone` keeps nothing.
 
 The management events are the acts of people on the panel. A received call is
 not one: it is in `webhook_client_calls` already, with its outcome, so it is

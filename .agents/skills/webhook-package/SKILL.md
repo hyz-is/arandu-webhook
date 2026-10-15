@@ -21,7 +21,7 @@ webhooks: a dialect or a policy it lacks is asked for in this module.
 ## Install
 
 ```bash
-go get github.com/hyz-is/arandu-webhook@v0.3.0
+go get github.com/hyz-is/arandu-webhook@v0.4.0
 ```
 
 It requires framework v0.56 and hesape v0.56. Keep hesape at v0.56:
@@ -119,6 +119,11 @@ published; `Validator: webhook.HeaderSecret{Header: ...}` for a provider that
 sends a shared secret as it is, `webhook.StandardWebhooks{}` for that scheme;
 `Statuses` for what each refusal answers; `ProcessSync` to process before
 answering and answer with the processor's status and body.
+
+A path parameter that is a bearer token is not kept with the call: the call's
+URL is the receiver's route unless `URL: webhook.URLFull`. A processor that
+needs who connected or every header reads `Call.RemoteAddr`,
+`Call.HeadersSHA256`, and -- in a `ProcessSync` -- `Call.ReceivedHeaders()`.
 
 **Symptom:** a receiver answers 404 for every call. `Resolve` found no record:
 the path, the record turned off, or a tenant that is not valid.

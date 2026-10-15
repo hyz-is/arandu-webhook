@@ -36,7 +36,7 @@ job, a scheduled task — and in an application's own code `aru doctor` reports 
 as `system-grant-outside-scope` when it appears in a handler, and
 `system-grant-without-tenant` when it is called with an empty tenant. A lint,
 not the type system, and one that never runs over an installed package. Nothing
-here reports it either. This package reaches for it in six places, each with an
+here reports it either. This package reaches for it in eight places, each with an
 `//arandu:system-grant` comment that says why: storing a received call, whose
 signature checked against the secret the application configured -- or the
 secret of the record a receiver's `Resolve` found -- and whose tenant is the
@@ -44,8 +44,15 @@ Receiver's or that record's, never one a path named; queueing its processing in
 that same tenant; processing it at once, for a `ProcessSync` receiver; the
 Publisher, in the tenant the outbox row was committed in; the test call, after
 `EndpointPolicy` authorized it, under `DeliveryDispatch`; and every attempt's
-job, in the tenant the delivery was recorded in, under the same action. Add a
-seventh only with the same kind of reason, written beside it.
+job, in the tenant the delivery was recorded in, under the same action; and the
+two scheduled cleans, once for each tenant that has rows in their table. Add a
+ninth only with the same kind of reason, written beside it.
+
+The cleans find those tenants with one statement that reads the `tenant_id`
+column of the module's own table and nothing else (`eachTenant` in
+`module.go`): it is the only read that crosses tenants, it returns no row of
+anybody's, and every row the clean then removes it reaches through the Model
+with a Grant of that one tenant.
 
 The engine has no subject to ask a policy about. `Module.Send`,
 `Outgoing.Dispatch`, the Publisher and the attempt job take a Grant and check it
