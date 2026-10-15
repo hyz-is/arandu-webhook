@@ -31,16 +31,38 @@ type Endpoint struct {
 	// Events is the comma-separated list of event names it receives; "*"
 	// receives every event.
 	Events string `db:"events"`
-	// Signer is how its calls are signed: SignerArandu or SignerHMAC.
+	// Dialect is how its calls are signed and which headers they carry:
+	// DialectArandu, DialectHMAC or DialectStandardWebhooks.
+	Dialect string `db:"dialect"`
+	// Signer is the column v0.1.0 read the dialect from, kept in step with
+	// Dialect for a binary of that release during a rollout: DialectArandu or
+	// DialectHMAC, and DialectArandu for a dialect it does not know. Read
+	// Dialect.
 	Signer string `db:"signer"`
-	// SignatureHeader is the header a SignerHMAC signature travels in.
+	// SignatureHeader is the header a DialectHMAC signature travels in.
 	SignatureHeader string `db:"signature_header"`
+	// AranduHeaders is whether a DialectHMAC call also carries the Arandu
+	// signature, timestamp and delivery id headers. The other dialects ignore
+	// it: an Arandu call always carries them, a Standard Webhooks call never.
+	AranduHeaders Flag `db:"include_arandu_headers"`
 	// Secret is the sealed signing secret. It never leaves in a response.
 	Secret string `db:"secret"`
+	// PreviousSecrets is the sealed JSON list of the secrets still signing
+	// after a rotation, each until it retires; empty when none.
+	PreviousSecrets string `db:"previous_secrets"`
 	// Headers is the sealed JSON object of extra headers, empty when none.
 	Headers string `db:"headers"`
+	// Policy is the JSON of the endpoint's own delivery policy, empty when it
+	// follows Server.Policy.
+	Policy string `db:"policy"`
 	// Active is whether it receives events.
 	Active Flag `db:"active"`
+	// ConsecutiveFailures is how many of its deliveries in a row gave up.
+	ConsecutiveFailures int `db:"consecutive_failures"`
+	// DisabledAt and DisabledReason say when and why it was turned off by the
+	// engine; both are cleared when it is turned on.
+	DisabledAt     *time.Time `db:"disabled_at"`
+	DisabledReason string     `db:"disabled_reason"`
 
 	CreatedAt time.Time `db:"created_at"`
 	UpdatedAt time.Time `db:"updated_at"`
@@ -96,47 +118,158 @@ const (
 	CallFailed CallStatus = "failed"
 )
 
-// The signers of an endpoint.
+// The dialects an endpoint is called in.
 const (
-	// SignerArandu signs with hesape/webhook's scheme: X-Arandu-Signature,
-	// sha256= over the timestamp, the delivery id and the body.
-	SignerArandu = "arandu"
-	// SignerHMAC adds webhook-server's DefaultSigner: the hex HMAC-SHA256 of
-	// the body, in the endpoint's SignatureHeader.
-	SignerHMAC = "hmac"
+	// DialectArandu signs with hesape's scheme: X-Arandu-Signature, sha256=
+	// and the hex HMAC-SHA256 of the timestamp, the delivery id and the body,
+	// beside X-Arandu-Timestamp and X-Arandu-Delivery-Id. Server.HeaderPrefix
+	// renames the three.
+	DialectArandu = "arandu"
+	// DialectHMAC is webhook-server's DefaultSigner: the hex HMAC-SHA256 of
+	// the body, in the endpoint's SignatureHeader, with the Arandu headers
+	// beside it unless the endpoint turns them off.
+	DialectHMAC = "hmac"
+	// DialectStandardWebhooks is the Standard Webhooks specification:
+	// Webhook-Id, Webhook-Timestamp and Webhook-Signature, which carries
+	// "v1," and the base64 HMAC-SHA256 of id.timestamp.body under the key the
+	// whsec_ secret encodes, once per secret still signing, newest first.
+	DialectStandardWebhooks = "standard-webhooks"
 )
 
-// Delivery is the record hesape/webhook keeps of one call to one endpoint:
-// its status, its attempts, the receiver's last answer. This package reads it
-// and never writes it; the worker does.
+// The signers of v0.1.0, which are the first two dialects.
+const (
+	// SignerArandu is DialectArandu.
+	SignerArandu = DialectArandu
+	// SignerHMAC is DialectHMAC.
+	SignerHMAC = DialectHMAC
+)
+
+// Delivery is one message to one address, and where its attempts stand: the
+// body frozen when it was recorded, the extra headers sealed beside it, the
+// number of attempts it gets and the waits between them, and the receiver's
+// last answer. The signature is made at each attempt, so neither a secret nor
+// a signature is ever stored with it.
 //
 // Deliveries, DeliveryQuery and DeliveryCollection are generated beside this
 // file, in DeliveryQuery.go, by aru model:build.
 type Delivery struct {
 	model.Model
 
+	// ID is the delivery's identity: the Delivery-Id of the Arandu dialect
+	// and the Webhook-Id of Standard Webhooks, the same on every attempt.
 	ID       string `db:"id"`
 	TenantID string `db:"tenant_id"`
 
-	EventID    string `db:"event_id"`
-	EventName  string `db:"event_name"`
+	// EventID is what the delivery was made for; one event reaches one
+	// endpoint once.
+	EventID   string `db:"event_id"`
+	EventName string `db:"event_name"`
+	// EndpointID is the stored endpoint, or "url:" and a digest of the
+	// address for a call built with Outgoing.
 	EndpointID string `db:"endpoint_id"`
 	URL        string `db:"url"`
+	// Dialect is the endpoint's, when the delivery was recorded.
+	Dialect string `db:"dialect"`
+	// Body is the request body, exactly as every attempt sends it, and
+	// BodySHA256 its hex SHA-256.
+	Body       string `db:"body"`
+	BodySHA256 string `db:"body_sha256"`
+	// Headers is the sealed JSON object of extra headers, empty when none.
+	Headers string `db:"headers"`
+	// SecretRef names where the signing secrets are read from at each
+	// attempt: the endpoint, or a secret of Server.Secrets.
+	SecretRef string `db:"secret_ref"`
+	// SignatureHeader and AranduHeaders are the DialectHMAC settings.
+	SignatureHeader string `db:"signature_header"`
+	AranduHeaders   Flag   `db:"include_arandu_headers"`
 	// Status is pending, processing, delivered or failed.
-	Status   string `db:"status"`
-	Attempts int64  `db:"attempts"`
+	Status string `db:"status"`
+	// Attempts is how many attempts were made, and MaxAttempts how many it
+	// gets.
+	Attempts    int64 `db:"attempts"`
+	MaxAttempts int64 `db:"max_attempts"`
+	// Backoff is the JSON list of the waits before each attempt after the
+	// first, in milliseconds, frozen when the delivery was recorded.
+	Backoff string `db:"backoff"`
 	// Permanent is a failure retrying cannot fix.
-	Permanent      Flag       `db:"permanent"`
+	Permanent Flag `db:"permanent"`
+	// NextAttemptAt is when the next attempt is due, while it is pending.
+	NextAttemptAt  *time.Time `db:"next_attempt_at"`
 	ResponseStatus *int64     `db:"response_status"`
 	LastError      *string    `db:"last_error"`
-	CreatedAt      time.Time  `db:"created_at"`
-	UpdatedAt      time.Time  `db:"updated_at"`
-	DeliveredAt    *time.Time `db:"delivered_at"`
+	// ClaimToken and LeaseUntil are the attempt in progress: whoever holds the
+	// token settles the attempt, and nobody else starts one until the lease
+	// ends.
+	ClaimToken  *string    `db:"claim_token"`
+	LeaseUntil  *time.Time `db:"lease_until"`
+	CreatedAt   time.Time  `db:"created_at"`
+	UpdatedAt   time.Time  `db:"updated_at"`
+	DeliveredAt *time.Time `db:"delivered_at"`
 }
 
+// The states of a delivery.
+const (
+	// DeliveryPending waits for its next attempt.
+	DeliveryPending = "pending"
+	// DeliveryProcessing is an attempt in progress.
+	DeliveryProcessing = "processing"
+	// DeliveryDelivered was answered with a 2xx.
+	DeliveryDelivered = "delivered"
+	// DeliveryFailed gave up: its attempts are spent, or its last failure was
+	// one retrying cannot fix.
+	DeliveryFailed = "failed"
+)
+
+// DeliveryAttempt is one attempt of a delivery: when it was signed, what
+// the receiver answered, how long it took. It is written when the attempt is
+// settled, in the same transaction as the delivery.
+//
+// DeliveryAttempts, DeliveryAttemptQuery and DeliveryAttemptCollection are
+// generated beside this file, in DeliveryAttemptQuery.go, by aru model:build.
+type DeliveryAttempt struct {
+	model.Model
+
+	ID       string `db:"id"`
+	TenantID string `db:"tenant_id"`
+
+	DeliveryID string `db:"delivery_id"`
+	EndpointID string `db:"endpoint_id"`
+	// Attempt is its number, from 1.
+	Attempt int64 `db:"attempt"`
+	// Trigger is AttemptScheduled or AttemptManual.
+	Trigger string `db:"triggered_by"`
+	// Succeeded is whether the receiver answered with a 2xx.
+	Succeeded Flag `db:"succeeded"`
+	// ResponseStatus is the receiver's status, nil when there was no answer.
+	ResponseStatus *int64 `db:"response_status"`
+	// Error is the failure's code, empty when it succeeded.
+	Error string `db:"error"`
+	// Response is the start of the answer's body, as text, for the panel.
+	Response string `db:"response"`
+	// DurationMS is how long the request took.
+	DurationMS int64 `db:"duration_ms"`
+	// SignedAt is the timestamp the attempt was signed with.
+	SignedAt  time.Time `db:"signed_at"`
+	CreatedAt time.Time `db:"created_at"`
+}
+
+// What started an attempt.
+const (
+	// AttemptScheduled is an attempt the delivery's plan made.
+	AttemptScheduled = "scheduled"
+	// AttemptManual is an attempt somebody asked for: a redelivery.
+	AttemptManual = "manual"
+)
+
 var deliveryTable = model.NewTable(model.TableSpec{
-	Name:      "webhook_deliveries",
+	Name:      deliveriesTable,
 	New:       func() model.Entity { return new(Delivery) },
+	ManualKey: true,
+})
+
+var deliveryAttemptTable = model.NewTable(model.TableSpec{
+	Name:      attemptsTable,
+	New:       func() model.Entity { return new(DeliveryAttempt) },
 	ManualKey: true,
 })
 
@@ -156,9 +289,15 @@ var callTable = model.NewTable(model.TableSpec{
 
 // The table names, declared once for the migrations and the queries.
 const (
-	endpointsTable = "webhook_server_endpoints"
-	callsTable     = "webhook_client_calls"
+	endpointsTable  = "webhook_server_endpoints"
+	callsTable      = "webhook_client_calls"
+	deliveriesTable = "webhook_server_deliveries"
+	attemptsTable   = "webhook_server_delivery_attempts"
 )
+
+// maxDeliveryIDLen is the width of a delivery's id and event id, which the
+// caller may choose.
+const maxDeliveryIDLen = 128
 
 // maxIdentifierLen is the width of an identifier column.
 const maxIdentifierLen = 64
@@ -188,6 +327,79 @@ func (e Endpoint) Receives(event string) bool {
 		}
 	}
 	return false
+}
+
+// signerFor is what the v0.1.0 signer column holds for a dialect.
+func signerFor(dialect string) string {
+	if dialect == DialectHMAC {
+		return SignerHMAC
+	}
+	return SignerArandu
+}
+
+// Enable turns the endpoint on and clears what the engine recorded when it
+// turned it off.
+func (e *Endpoint) Enable(now time.Time) {
+	e.Active, e.ConsecutiveFailures, e.DisabledAt, e.DisabledReason, e.UpdatedAt = true, 0, nil, "", now
+}
+
+// Disable turns the endpoint off, and keeps why when the engine did it.
+func (e *Endpoint) Disable(reason string, now time.Time) {
+	e.Active, e.UpdatedAt = false, now
+	if reason != "" {
+		at := now
+		e.DisabledAt, e.DisabledReason = &at, reason
+	}
+}
+
+// DisabledByFailures is the reason the engine records when an endpoint's
+// deliveries gave up DisableAfter times in a row.
+const DisabledByFailures = "consecutive_failures"
+
+// ShouldDisable reports whether the engine turns the endpoint off: it is
+// active, and disableAfter of its deliveries in a row gave up.
+func (e Endpoint) ShouldDisable(disableAfter int) bool {
+	return disableAfter > 0 && bool(e.Active) && e.ConsecutiveFailures >= disableAfter
+}
+
+// Waits returns the waits before each attempt after the first, as frozen
+// when the delivery was recorded.
+func (d Delivery) Waits() []time.Duration {
+	var ms []int64
+	if d.Backoff != "" {
+		_ = json.Unmarshal([]byte(d.Backoff), &ms)
+	}
+	out := make([]time.Duration, 0, len(ms))
+	for _, wait := range ms {
+		out = append(out, time.Duration(wait)*time.Millisecond)
+	}
+	return out
+}
+
+// WaitAfter is how long the delivery waits after its attempt number n
+// failed, before attempt n+1.
+func (d Delivery) WaitAfter(n int64) time.Duration {
+	waits := d.Waits()
+	switch {
+	case n >= 1 && int(n-1) < len(waits):
+		return waits[n-1]
+	case len(waits) > 0:
+		return waits[len(waits)-1]
+	}
+	return 0
+}
+
+// Spent reports whether the delivery has no attempt left.
+func (d Delivery) Spent() bool { return d.Attempts >= d.MaxAttempts }
+
+// encodeWaits is the JSON a delivery freezes its waits as.
+func encodeWaits(waits []time.Duration) string {
+	ms := make([]int64, 0, len(waits))
+	for _, wait := range waits {
+		ms = append(ms, wait.Milliseconds())
+	}
+	encoded, _ := json.Marshal(ms)
+	return string(encoded)
 }
 
 // Header returns the first value of a kept header, by any case of its name.
@@ -294,12 +506,18 @@ func (r EndpointResource) ToArray() map[string]any {
 	}
 	out := map[string]any{
 		"id": r.e.ID, "name": r.e.Name, "url": r.e.URL, "events": r.e.EventList(),
-		"signer": r.e.Signer, "active": bool(r.e.Active),
-		"created_at": r.e.CreatedAt.UTC().Format(time.RFC3339),
-		"updated_at": r.e.UpdatedAt.UTC().Format(time.RFC3339),
+		"dialect": r.e.Dialect, "signer": r.e.Dialect, "active": bool(r.e.Active),
+		"consecutive_failures": r.e.ConsecutiveFailures,
+		"created_at":           r.e.CreatedAt.UTC().Format(time.RFC3339),
+		"updated_at":           r.e.UpdatedAt.UTC().Format(time.RFC3339),
 	}
-	if r.e.Signer == SignerHMAC {
+	if r.e.Dialect == DialectHMAC {
 		out["signature_header"] = r.e.SignatureHeader
+		out["include_arandu_headers"] = bool(r.e.AranduHeaders)
+	}
+	if r.e.DisabledAt != nil {
+		out["disabled_at"] = r.e.DisabledAt.UTC().Format(time.RFC3339)
+		out["disabled_reason"] = r.e.DisabledReason
 	}
 	if r.headers != nil {
 		out["header_names"] = r.headers
@@ -340,7 +558,7 @@ func (r CallResource) ToArray() map[string]any {
 func (r CallResource) With() map[string]any { return nil }
 
 // DeliveryResource is the list of fields one delivery may answer with. The
-// headers, the body and the secret reference stay in the record.
+// body, the headers and the secret reference stay in the record.
 type DeliveryResource struct{ d *Delivery }
 
 // NewDeliveryResource snapshots one delivery for the response.
@@ -352,8 +570,9 @@ func (r DeliveryResource) ToArray() map[string]any {
 		return map[string]any{}
 	}
 	out := map[string]any{
-		"id": r.d.ID, "event_id": r.d.EventID, "event": r.d.EventName, "status": r.d.Status,
-		"attempts": r.d.Attempts, "permanent": bool(r.d.Permanent),
+		"id": r.d.ID, "event_id": r.d.EventID, "event": r.d.EventName, "endpoint_id": r.d.EndpointID,
+		"status": r.d.Status, "attempts": r.d.Attempts, "max_attempts": r.d.MaxAttempts,
+		"permanent": bool(r.d.Permanent), "body_sha256": r.d.BodySHA256,
 		"created_at": r.d.CreatedAt.UTC().Format(time.RFC3339),
 	}
 	if r.d.ResponseStatus != nil {
@@ -361,6 +580,9 @@ func (r DeliveryResource) ToArray() map[string]any {
 	}
 	if r.d.LastError != nil {
 		out["last_error"] = *r.d.LastError
+	}
+	if r.d.NextAttemptAt != nil && r.d.Status == DeliveryPending {
+		out["next_attempt_at"] = r.d.NextAttemptAt.UTC().Format(time.RFC3339)
 	}
 	if r.d.DeliveredAt != nil {
 		out["delivered_at"] = r.d.DeliveredAt.UTC().Format(time.RFC3339)
@@ -370,6 +592,35 @@ func (r DeliveryResource) ToArray() map[string]any {
 
 // With adds nothing beside the fields.
 func (r DeliveryResource) With() map[string]any { return nil }
+
+// DeliveryAttemptResource is the list of fields one attempt may answer with.
+type DeliveryAttemptResource struct{ a *DeliveryAttempt }
+
+// NewDeliveryAttemptResource snapshots one attempt for the response.
+func NewDeliveryAttemptResource(a *DeliveryAttempt) DeliveryAttemptResource {
+	return DeliveryAttemptResource{a: a}
+}
+
+// ToArray returns the fields that may leave, by name.
+func (r DeliveryAttemptResource) ToArray() map[string]any {
+	if r.a == nil {
+		return map[string]any{}
+	}
+	out := map[string]any{
+		"id": r.a.ID, "delivery_id": r.a.DeliveryID, "attempt": r.a.Attempt, "trigger": r.a.Trigger,
+		"succeeded": bool(r.a.Succeeded), "error": r.a.Error, "response": r.a.Response,
+		"duration_ms": r.a.DurationMS,
+		"signed_at":   r.a.SignedAt.UTC().Format(time.RFC3339),
+		"created_at":  r.a.CreatedAt.UTC().Format(time.RFC3339),
+	}
+	if r.a.ResponseStatus != nil {
+		out["response_status"] = *r.a.ResponseStatus
+	}
+	return out
+}
+
+// With adds nothing beside the fields.
+func (r DeliveryAttemptResource) With() map[string]any { return nil }
 
 // page is a list of resources and the cursor of the next page.
 type page struct {

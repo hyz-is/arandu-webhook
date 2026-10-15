@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -30,10 +31,15 @@ const (
 	// DefaultQueue is the queue the deliveries and the processing of received
 	// calls travel on.
 	DefaultQueue = "webhooks"
-	// DefaultUserAgent is what an outgoing call says it is.
+	// DefaultUserAgent is what an outgoing call says it is under the default
+	// policy.
 	DefaultUserAgent = "Arandu-Webhook/1.0"
-	// DefaultTimeout is how long an outgoing call may take.
+	// DefaultTimeout is how long an outgoing call may take under the default
+	// policy.
 	DefaultTimeout = 10 * time.Second
+	// DefaultRetention is how long a delivery's record and its attempts are
+	// kept.
+	DefaultRetention = 30 * 24 * time.Hour
 	// DefaultDeleteAfterDays is how old a received call is when the clean
 	// removes it, as webhook-client's delete_after_days.
 	DefaultDeleteAfterDays = 30
@@ -104,15 +110,27 @@ type Server struct {
 	// Queue is the queue deliveries travel on. Empty means DefaultQueue.
 	Queue string
 
-	// UserAgent is sent with every call. Empty means DefaultUserAgent.
+	// Policy is how every delivery is made: the attempts and the waits between
+	// them, what counts as a failure, the transport's limits. An endpoint may
+	// carry its own. Nil means DefaultPolicy, with UserAgent and Timeout below
+	// laid over it.
+	Policy *Policy
+
+	// UserAgent is sent with every call when Policy is nil. Empty means
+	// DefaultUserAgent. Set Policy.UserAgent instead when Policy is set.
 	UserAgent string
 
-	// Timeout is how long one call may take. Zero means DefaultTimeout.
+	// Timeout is how long one call may take when Policy is nil. Zero means
+	// DefaultTimeout. Set Policy.Timeout instead when Policy is set.
 	Timeout time.Duration
 
-	// Retention is how long a delivery's record is kept. Zero means
-	// hesape/webhook's DefaultRetention.
+	// Retention is how long a delivery's record and its attempts are kept.
+	// Zero means DefaultRetention.
 	Retention time.Duration
+
+	// Now is the clock the deliveries read: the signed timestamps, the next
+	// attempt, the lease. Nil is time.Now, and a test replaces it.
+	Now func() time.Time
 
 	// HeaderPrefix renames the delivery headers, X-Arandu-Signature becoming
 	// <HeaderPrefix>-Signature, so a receiver reads the product's name. The
@@ -121,8 +139,12 @@ type Server struct {
 	// X-Arandu.
 	HeaderPrefix string
 
-	// HTTPClient carries the calls. Nil uses hesape's client, which refuses
-	// private and loopback addresses on every hop.
+	// HTTPClient carries the calls. Nil uses hesape's guarded client, with a
+	// dialer that also refuses the shared address space (100.64.0.0/10): no
+	// call reaches a loopback, private, link-local or shared address, on any
+	// hop. A client given here keeps its own transport and with it its own
+	// answer to where a call may connect, which is what a test that delivers
+	// to a local server needs.
 	HTTPClient *http.Client
 
 	// Events is the list an endpoint may subscribe to. Empty accepts any
@@ -217,6 +239,14 @@ func (c Config) Validate() error {
 	if c.Server.Timeout < 0 || c.Server.Retention < 0 {
 		return errors.New("webhook: Config.Server.Timeout and Retention cannot be negative")
 	}
+	if c.Server.Policy != nil {
+		if c.Server.Timeout != 0 || c.Server.UserAgent != "" {
+			return errors.New("webhook: Config.Server.Timeout and UserAgent apply only without a Policy; set Policy.Timeout and Policy.UserAgent instead")
+		}
+		if err := c.Server.Policy.Validate(); err != nil {
+			return fmt.Errorf("webhook: Config.Server.Policy: %w", err)
+		}
+	}
 	if p := c.Server.HeaderPrefix; p != "" && (!headerPattern.MatchString(p) || strings.EqualFold(p, "X-Arandu")) {
 		return fmt.Errorf("webhook: Config.Server.HeaderPrefix %q is not a header name such as X-Acme", p)
 	}
@@ -306,11 +336,24 @@ func (c Config) withDefaults() Config {
 	if c.Server.Queue == "" {
 		c.Server.Queue = DefaultQueue
 	}
-	if c.Server.UserAgent == "" {
-		c.Server.UserAgent = DefaultUserAgent
+	if c.Server.Policy == nil {
+		policy := DefaultPolicy()
+		if c.Server.UserAgent != "" {
+			policy.UserAgent = c.Server.UserAgent
+		}
+		if c.Server.Timeout != 0 {
+			policy.Timeout = c.Server.Timeout
+		}
+		c.Server.Policy = &policy
+	} else {
+		policy := c.Server.Policy.clone()
+		c.Server.Policy = &policy
 	}
-	if c.Server.Timeout == 0 {
-		c.Server.Timeout = DefaultTimeout
+	if c.Server.Retention == 0 {
+		c.Server.Retention = DefaultRetention
+	}
+	if c.Server.Now == nil {
+		c.Server.Now = time.Now
 	}
 	receivers := make([]Receiver, len(c.Receivers))
 	for i, r := range c.Receivers {
@@ -339,4 +382,206 @@ func (c Config) withDefaults() Config {
 	}
 	c.Receivers = receivers
 	return c
+}
+
+// The limits a Policy is refused beyond. They keep a policy written by a
+// person, or stored on an endpoint, from asking for something the engine
+// should not do.
+const (
+	// MaxTries is the most attempts one delivery may be given.
+	MaxTries = 20
+	// MaxBackoff is the longest wait between two attempts.
+	MaxBackoff = 7 * 24 * time.Hour
+	// MaxRedirects is the most redirects a delivery may follow.
+	MaxRedirects = 10
+	// MaxTimeout is the longest one attempt may take.
+	MaxTimeout = 2 * time.Minute
+	// MaxRequestBytes is the largest body a delivery may carry.
+	MaxRequestBytes = 1 << 20
+	// MaxResponseBytes is the most of an answer an attempt reads.
+	MaxResponseBytes = 1 << 20
+)
+
+// RetryMode says which failed attempts are tried again.
+type RetryMode string
+
+const (
+	// RetryTransient tries again what another attempt may fix -- a transport
+	// error, 408, 425, 429 and the 5xx -- and gives up at once on every other
+	// answer, on an address that is refused and on a body too large. It is
+	// the default.
+	RetryTransient RetryMode = "transient"
+	// RetryEveryFailure tries again every failed attempt, whatever it was,
+	// until the tries are spent: any answer outside 2xx is a failure like any
+	// other.
+	RetryEveryFailure RetryMode = "every-failure"
+)
+
+// Policy is how a delivery is made. It is set on Server for every endpoint,
+// and an endpoint may carry its own. Tries and Backoff are frozen on each
+// delivery when it is recorded, so changing a policy neither revives a
+// delivery that gave up nor shortens one already waiting; the rest is read at
+// every attempt.
+//
+// A Policy is used as written: a zero field means zero, not a default. Start
+// from DefaultPolicy to change one thing.
+type Policy struct {
+	// Tries is how many attempts a delivery gets, the first included.
+	Tries int
+	// Backoff is the wait before each attempt after the first: Backoff[0]
+	// before the second, Backoff[1] before the third. When it is shorter than
+	// Tries-1 its last wait is repeated. There is no jitter: the next attempt
+	// is written on the delivery, so two workers never race for one.
+	Backoff []time.Duration
+	// Retry is which failures are tried again. Empty means RetryTransient.
+	Retry RetryMode
+	// HonorRetryAfter waits as long as the receiver's Retry-After asks before
+	// the next attempt, when that is longer than Backoff says.
+	HonorRetryAfter bool
+	// HTTPSOnly refuses an address that is not https, at the endpoint's form
+	// and at every attempt.
+	HTTPSOnly bool
+	// MaxRedirects is how many redirects an attempt follows; 0 follows none,
+	// and the redirect itself is then the answer, a failure.
+	MaxRedirects int
+	// MaxRequestBytes is the largest body a delivery may be recorded with.
+	MaxRequestBytes int64
+	// MaxResponseBytes is how much of an answer an attempt reads; the rest is
+	// left unread, and the answer's status decides the attempt.
+	MaxResponseBytes int64
+	// Timeout is how long one attempt may take, the answer read included.
+	Timeout time.Duration
+	// UserAgent is sent with every attempt. Empty sends none of ours: Go's
+	// client then says what it is.
+	UserAgent string
+	// DisableAfter turns a stored endpoint off once this many of its
+	// deliveries in a row gave up, and records why. A delivered one resets
+	// the count. 0 never turns one off.
+	DisableAfter int
+}
+
+// DefaultPolicy is the policy a delivery gets when nobody chose one: 5
+// attempts, waiting 5 s, 30 s, 2 min and 10 min between them, the receiver's
+// Retry-After honored, 408, 425, 429 and the 5xx tried again and every other
+// answer final, at most 5 redirects, http or https, a body of up to 1 MiB, the
+// first 1 MiB of an answer read, 10 s per attempt, and DefaultUserAgent.
+func DefaultPolicy() Policy {
+	return Policy{
+		Tries:            5,
+		Backoff:          []time.Duration{5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute},
+		Retry:            RetryTransient,
+		HonorRetryAfter:  true,
+		MaxRedirects:     5,
+		MaxRequestBytes:  MaxRequestBytes,
+		MaxResponseBytes: MaxResponseBytes,
+		Timeout:          DefaultTimeout,
+		UserAgent:        DefaultUserAgent,
+	}
+}
+
+// Validate reports what the policy cannot be used with.
+func (p Policy) Validate() error {
+	switch {
+	case p.Tries < 1 || p.Tries > MaxTries:
+		return fmt.Errorf("Tries is %d, and has to be between 1 and %d", p.Tries, MaxTries)
+	case len(p.Backoff) > MaxTries:
+		return fmt.Errorf("Backoff has %d waits, and at most %d are used", len(p.Backoff), MaxTries)
+	case p.Tries > 1 && len(p.Backoff) == 0:
+		return errors.New("Backoff is empty, and a policy of more than one try needs the wait between them")
+	case p.Retry != "" && p.Retry != RetryTransient && p.Retry != RetryEveryFailure:
+		return fmt.Errorf("Retry %q is not RetryTransient or RetryEveryFailure", p.Retry)
+	case p.MaxRedirects < 0 || p.MaxRedirects > MaxRedirects:
+		return fmt.Errorf("MaxRedirects is %d, and has to be between 0 and %d", p.MaxRedirects, MaxRedirects)
+	case p.MaxRequestBytes < 1 || p.MaxRequestBytes > MaxRequestBytes:
+		return fmt.Errorf("MaxRequestBytes is %d, and has to be between 1 and %d", p.MaxRequestBytes, MaxRequestBytes)
+	case p.MaxResponseBytes < 0 || p.MaxResponseBytes > MaxResponseBytes:
+		return fmt.Errorf("MaxResponseBytes is %d, and has to be between 0 and %d", p.MaxResponseBytes, MaxResponseBytes)
+	case p.Timeout <= 0 || p.Timeout > MaxTimeout:
+		return fmt.Errorf("Timeout is %s, and has to be above zero and at most %s", p.Timeout, MaxTimeout)
+	case p.DisableAfter < 0:
+		return errors.New("DisableAfter cannot be negative")
+	}
+	for _, wait := range p.Backoff {
+		if wait < 0 || wait > MaxBackoff {
+			return fmt.Errorf("Backoff has the wait %s, and each has to be between 0 and %s", wait, MaxBackoff)
+		}
+	}
+	for i := 0; i < len(p.UserAgent); i++ {
+		if p.UserAgent[i] < ' ' || p.UserAgent[i] == 0x7f {
+			return errors.New("UserAgent carries a control character")
+		}
+	}
+	return nil
+}
+
+// plan is the waits before each attempt after the first, one per retry: the
+// Backoff, with its last wait repeated up to Tries-1.
+func (p Policy) plan() []time.Duration {
+	out := make([]time.Duration, 0, p.Tries)
+	for i := 1; i < p.Tries; i++ {
+		wait := time.Duration(0)
+		switch {
+		case i-1 < len(p.Backoff):
+			wait = p.Backoff[i-1]
+		case len(p.Backoff) > 0:
+			wait = p.Backoff[len(p.Backoff)-1]
+		}
+		out = append(out, wait)
+	}
+	return out
+}
+
+func (p Policy) clone() Policy {
+	p.Backoff = append([]time.Duration(nil), p.Backoff...)
+	return p
+}
+
+// policyJSON is a Policy as an endpoint stores it, durations in milliseconds.
+type policyJSON struct {
+	Tries            int       `json:"tries"`
+	Backoff          []int64   `json:"backoff_ms"`
+	Retry            RetryMode `json:"retry"`
+	HonorRetryAfter  bool      `json:"honor_retry_after"`
+	HTTPSOnly        bool      `json:"https_only"`
+	MaxRedirects     int       `json:"max_redirects"`
+	MaxRequestBytes  int64     `json:"max_request_bytes"`
+	MaxResponseBytes int64     `json:"max_response_bytes"`
+	TimeoutMS        int64     `json:"timeout_ms"`
+	UserAgent        string    `json:"user_agent"`
+	DisableAfter     int       `json:"disable_after"`
+}
+
+func encodePolicy(p *Policy) (string, error) {
+	if p == nil {
+		return "", nil
+	}
+	out := policyJSON{
+		Tries: p.Tries, Retry: p.Retry, HonorRetryAfter: p.HonorRetryAfter, HTTPSOnly: p.HTTPSOnly,
+		MaxRedirects: p.MaxRedirects, MaxRequestBytes: p.MaxRequestBytes, MaxResponseBytes: p.MaxResponseBytes,
+		TimeoutMS: p.Timeout.Milliseconds(), UserAgent: p.UserAgent, DisableAfter: p.DisableAfter,
+	}
+	for _, wait := range p.Backoff {
+		out.Backoff = append(out.Backoff, wait.Milliseconds())
+	}
+	encoded, err := json.Marshal(out)
+	return string(encoded), err
+}
+
+func decodePolicy(text string) (*Policy, error) {
+	if text == "" {
+		return nil, nil
+	}
+	var in policyJSON
+	if err := json.Unmarshal([]byte(text), &in); err != nil {
+		return nil, fmt.Errorf("webhook: the endpoint's policy is not readable: %w", err)
+	}
+	p := Policy{
+		Tries: in.Tries, Retry: in.Retry, HonorRetryAfter: in.HonorRetryAfter, HTTPSOnly: in.HTTPSOnly,
+		MaxRedirects: in.MaxRedirects, MaxRequestBytes: in.MaxRequestBytes, MaxResponseBytes: in.MaxResponseBytes,
+		Timeout: time.Duration(in.TimeoutMS) * time.Millisecond, UserAgent: in.UserAgent, DisableAfter: in.DisableAfter,
+	}
+	for _, ms := range in.Backoff {
+		p.Backoff = append(p.Backoff, time.Duration(ms)*time.Millisecond)
+	}
+	return &p, nil
 }

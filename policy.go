@@ -11,13 +11,14 @@ import (
 // a typo in an action name would silently authorize nothing, or worse,
 // everything. arandu-permission fills a Subject's Actions with them.
 const (
-	// EndpointView is reading one endpoint, and its deliveries.
+	// EndpointView is reading one endpoint, its deliveries and their
+	// attempts.
 	EndpointView security.Action = "webhook.endpoint.view"
 	// EndpointList is paging through the endpoints.
 	EndpointList security.Action = "webhook.endpoint.list"
 	// EndpointCreate is adding one.
 	EndpointCreate security.Action = "webhook.endpoint.create"
-	// EndpointUpdate is changing one, including turning it off.
+	// EndpointUpdate is changing one, including turning it on and off.
 	EndpointUpdate security.Action = "webhook.endpoint.update"
 	// EndpointDelete is removing one.
 	EndpointDelete security.Action = "webhook.endpoint.delete"
@@ -25,6 +26,17 @@ const (
 	EndpointSecret security.Action = "webhook.endpoint.secret"
 	// EndpointTest is sending one webhook.test call to an endpoint.
 	EndpointTest security.Action = "webhook.endpoint.test"
+	// EndpointRotate is giving an endpoint a new signing secret, the previous
+	// one still signing until it retires.
+	EndpointRotate security.Action = "webhook.endpoint.rotate"
+	// EndpointImport is storing an endpoint with the id and the secrets it
+	// already has elsewhere, for an application moving its own endpoints into
+	// this module. Actions does not offer it: it belongs to the data
+	// migration, which runs with a subject the application builds for it.
+	EndpointImport security.Action = "webhook.endpoint.import"
+	// DeliveryRedeliver is sending one of an endpoint's deliveries again: the
+	// same id and the same body, under a new timestamp and signature.
+	DeliveryRedeliver security.Action = "webhook.delivery.redeliver"
 
 	// CallView is reading one received call.
 	CallView security.Action = "webhook.call.view"
@@ -39,6 +51,16 @@ const (
 	// and the policy refuses them to any subject.
 	CallReceive security.Action = "webhook.call.receive"
 	CallClean   security.Action = "webhook.call.clean"
+
+	// DeliveryDispatch is recording deliveries and making their attempts, and
+	// DeliveryClean removing the records older than the retention. Nobody
+	// holds them: the application's code dispatches under a Grant it issues
+	// for itself, the events relay and the worker do the same, and the policy
+	// refuses them to any subject. DeliveryDispatch has the value of
+	// hesape/webhook's ActionDispatch, so a Grant issued for either is one
+	// Grant.
+	DeliveryDispatch security.Action = "webhook.dispatch"
+	DeliveryClean    security.Action = "webhook.delivery.clean"
 )
 
 // Actions are the actions a person can be given, for arandu-permission to
@@ -46,6 +68,7 @@ const (
 func Actions() []security.Action {
 	return []security.Action{
 		EndpointView, EndpointList, EndpointCreate, EndpointUpdate, EndpointDelete, EndpointSecret, EndpointTest,
+		EndpointRotate, DeliveryRedeliver,
 		CallView, CallList, CallProcess,
 	}
 }
@@ -72,7 +95,8 @@ func (EndpointPolicy) Can(_ context.Context, s security.Subject, a security.Acti
 		return fmt.Errorf("a guest manages no endpoint")
 	}
 	switch a {
-	case EndpointView, EndpointList, EndpointCreate, EndpointUpdate, EndpointDelete, EndpointSecret, EndpointTest:
+	case EndpointView, EndpointList, EndpointCreate, EndpointUpdate, EndpointDelete, EndpointSecret, EndpointTest,
+		EndpointRotate, EndpointImport, DeliveryRedeliver:
 		if s.Can(a) {
 			return nil
 		}

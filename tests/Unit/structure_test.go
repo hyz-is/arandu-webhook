@@ -118,6 +118,8 @@ func TestThePackageUsesTheGeneratedConcreteModel(t *testing.T) {
 			"var endpointTable = model.NewTable(model.TableSpec{",
 			"var callTable = model.NewTable(model.TableSpec{",
 			"var deliveryTable = model.NewTable(model.TableSpec{",
+			"var deliveryAttemptTable = model.NewTable(model.TableSpec{",
+			"type DeliveryAttempt struct {\n\tmodel.Model\n",
 			"ManualKey: true,",
 			"// arandu:begin custom\n",
 			"// arandu:end custom\n",
@@ -135,6 +137,10 @@ func TestThePackageUsesTheGeneratedConcreteModel(t *testing.T) {
 		"DeliveryQuery.go": {
 			generatedHeading,
 			"func Deliveries(db model.DB) *DeliveryQuery",
+		},
+		"DeliveryAttemptQuery.go": {
+			generatedHeading,
+			"func DeliveryAttempts(db model.DB) *DeliveryAttemptQuery",
 		},
 		"service.go": {
 			"db     *data.DB",

@@ -3,13 +3,15 @@
 // Laravel, in one package.
 //
 // Sending: endpoints a tenant subscribes to events, each with a sealed
-// signing secret and sealed extra headers; the events outbox delivers to them
-// through hesape/webhook -- one durable record and one queued job per event
-// and endpoint, a signed request through a transport that refuses private
-// addresses, retries with backoff and Retry-After. Outgoing builds a call in
-// code, as webhook-server's WebhookCall. An endpoint signs with hesape's
-// scheme or adds webhook-server's DefaultSigner: the hex HMAC-SHA256 of the
-// body.
+// signing secret and sealed extra headers. The module owns the delivery: one
+// durable record per message and endpoint, its body frozen, written in the
+// same transaction as the job that makes its first attempt; every attempt
+// signed when it is made, in the endpoint's dialect -- hesape's Arandu scheme,
+// webhook-server's HMAC of the body, or Standard Webhooks -- through a
+// transport that refuses internal addresses, under a Policy that says how
+// many attempts, how far apart, and what counts as a failure. The events
+// outbox delivers through Publisher, Send delivers a message the application
+// built, and Outgoing builds a call in code, as webhook-server's WebhookCall.
 //
 // Receiving: a Receiver per system that calls the application, mounted at
 // ReceivePrefix/<name>, as webhook-client's configs. A call is checked against
@@ -24,7 +26,11 @@
 //	model.go      -> the endpoint, the received call, the delivery record
 //	policy.go     -> who may do what
 //	service.go    -> the use cases, and Model access after authorization
-//	server.go     -> sending: the Manager underneath, Outgoing, the resolver
+//	server.go     -> sending: recording deliveries, Publisher, Send, Outgoing
+//	delivery.go   -> the attempts: claim, request, settle, retry, clean
+//	dialect.go    -> how each dialect signs a request
+//	transport.go  -> the guarded client the attempts go out on
+//	audit.go      -> the management events stored in the outbox
 //	client.go     -> receiving: the pipeline and its processing job
 //	signature.go  -> the signers, the validators and the seal
 package webhook
@@ -84,11 +90,12 @@ func New(cfg Config, db *data.DB, sessions *security.SessionStore) (*Module, err
 	if err != nil {
 		return nil, err
 	}
-	s, err := newSender(db, cfg, seal)
+	audit := newAuditor(db, cfg.Server.Now)
+	s, err := newSender(db, cfg, seal, audit)
 	if err != nil {
 		return nil, err
 	}
-	c := newClient(db, cfg)
+	c := newClient(db, cfg, audit)
 	return &Module{
 		cfg: cfg, sessions: sessions, sender: s, client: c,
 		endpoints: newEndpointService(db, s), calls: newCallService(db, c),
@@ -106,15 +113,21 @@ func (m *Module) EndpointService() *EndpointService { return m.endpoints }
 // it from its own screens. Every method asks the policy.
 func (m *Module) CallService() *CallService { return m.calls }
 
-// Manager is hesape/webhook's Manager underneath, for an application that
-// dispatches to endpoints of its own.
-func (m *Module) Manager() *hwebhook.Manager { return m.sender.manager }
-
 // Publisher is the events outbox's listener that delivers each event to the
-// tenant's endpoints subscribed to it. The application adds it to its relay's
-// publishers.
-func (m *Module) Publisher() events.Publisher {
-	return hwebhook.NewPublisher(m.sender.manager, m.sender)
+// tenant's active endpoints subscribed to it. The application adds it to its
+// relay's publishers. The module's own management events, which travel on
+// the same outbox, are not delivered.
+func (m *Module) Publisher() events.Publisher { return publisher{s: m.sender} }
+
+// Send records one message to one of the tenant's endpoints, whatever it
+// subscribes to, and queues its first attempt in the same transaction: the
+// message the application built, its id and its body sent exactly as given
+// on every attempt. g carries DeliveryDispatch for the tenant: the
+// application decided to send, and that decision is the Grant. A second
+// message with the same EventID to the same endpoint answers the first
+// delivery and sends nothing.
+func (m *Module) Send(ctx context.Context, g security.Grant, endpointID string, msg Message) (*Delivery, error) {
+	return m.sender.send(ctx, g, endpointID, msg)
 }
 
 // Outgoing starts a call built in code, as webhook-server's
@@ -125,16 +138,14 @@ func (m *Module) Outgoing() *Outgoing { return &Outgoing{s: m.sender} }
 // application's CSRF exemption.
 func (m *Module) ReceivePrefix() string { return m.cfg.ReceivePrefix }
 
-// RegisterJobHandlers gives the worker the deliveries and the processing of
-// received calls. The worker is the application's, started by its worker
-// command.
+// RegisterJobHandlers gives the worker the attempts of the deliveries and
+// the processing of received calls. The worker is the application's,
+// started by its worker command, on Server.Queue.
 func (m *Module) RegisterJobHandlers(worker *queue.Worker) error {
 	if worker == nil {
 		return errors.New("webhook: RegisterJobHandlers needs a worker")
 	}
-	if err := m.sender.manager.RegisterJobHandlers(worker); err != nil {
-		return err
-	}
+	worker.HandleFunc(DeliverJob, m.sender.handle)
 	worker.HandleFunc(ProcessJob, m.client.handle)
 	return nil
 }
@@ -172,6 +183,12 @@ func (m *Module) Routes(r *fhttp.Router) {
 	r.Action(stdhttp.MethodGet, p+"/endpoints/{id}/secret", m.endpointSecret).Name("webhook.endpoints.secret")
 	r.Action(stdhttp.MethodPost, p+"/endpoints/{id}/test", m.endpointTest).Name("webhook.endpoints.test")
 	r.Action(stdhttp.MethodGet, p+"/endpoints/{id}/deliveries", m.endpointDeliveries).Name("webhook.endpoints.deliveries")
+	r.Action(stdhttp.MethodPost, p+"/endpoints/{id}/rotate", m.endpointRotate).Name("webhook.endpoints.rotate")
+	r.Action(stdhttp.MethodPost, p+"/endpoints/{id}/enable", m.endpointEnable).Name("webhook.endpoints.enable")
+	r.Action(stdhttp.MethodPost, p+"/endpoints/{id}/disable", m.endpointDisable).Name("webhook.endpoints.disable")
+	r.Action(stdhttp.MethodGet, p+"/deliveries/{id}", m.deliveryShow).Name("webhook.deliveries.show")
+	r.Action(stdhttp.MethodGet, p+"/deliveries/{id}/attempts", m.deliveryAttempts).Name("webhook.deliveries.attempts")
+	r.Action(stdhttp.MethodPost, p+"/deliveries/{id}/redeliver", m.deliveryRedeliver).Name("webhook.deliveries.redeliver")
 	r.Action(stdhttp.MethodGet, p+"/calls", m.callIndex).Name("webhook.calls.index")
 	r.Action(stdhttp.MethodGet, p+"/calls/{id}", m.callShow).Name("webhook.calls.show")
 	r.Action(stdhttp.MethodPost, p+"/calls/{id}/process", m.callProcess).Name("webhook.calls.process")
@@ -244,10 +261,69 @@ func (m *Module) endpointSecret(ctx *fhttp.Context) error {
 
 func (m *Module) endpointTest(ctx *fhttp.Context) error {
 	who, _ := ctx.User()
-	if err := m.endpoints.Test(ctx.Ctx(), who, ctx.Param("id")); err != nil {
+	delivery, err := m.endpoints.Test(ctx.Ctx(), who, ctx.Param("id"))
+	if err != nil {
 		return err
 	}
-	return ctx.Status(stdhttp.StatusAccepted)
+	return ctx.JSON(stdhttp.StatusAccepted, NewDeliveryResource(delivery))
+}
+
+func (m *Module) endpointRotate(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	secret, err := m.endpoints.Rotate(ctx.Ctx(), who, ctx.Param("id"), DefaultRotationOverlap)
+	if err != nil {
+		return err
+	}
+	return ctx.JSON(stdhttp.StatusOK, secretResource(secret))
+}
+
+func (m *Module) endpointEnable(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	record, err := m.endpoints.Enable(ctx.Ctx(), who, ctx.Param("id"))
+	if err != nil {
+		return err
+	}
+	return ctx.JSON(stdhttp.StatusOK, NewEndpointResource(record))
+}
+
+func (m *Module) endpointDisable(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	record, err := m.endpoints.Disable(ctx.Ctx(), who, ctx.Param("id"))
+	if err != nil {
+		return err
+	}
+	return ctx.JSON(stdhttp.StatusOK, NewEndpointResource(record))
+}
+
+func (m *Module) deliveryShow(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	delivery, err := m.endpoints.Delivery(ctx.Ctx(), who, ctx.Param("id"))
+	if err != nil {
+		return err
+	}
+	return ctx.JSON(stdhttp.StatusOK, NewDeliveryResource(delivery))
+}
+
+func (m *Module) deliveryAttempts(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	rows, err := m.endpoints.Attempts(ctx.Ctx(), who, ctx.Param("id"))
+	if err != nil {
+		return err
+	}
+	out := page{}
+	for _, row := range rows {
+		out.items = append(out.items, NewDeliveryAttemptResource(row).ToArray())
+	}
+	return ctx.JSON(stdhttp.StatusOK, out)
+}
+
+func (m *Module) deliveryRedeliver(ctx *fhttp.Context) error {
+	who, _ := ctx.User()
+	delivery, err := m.endpoints.Redeliver(ctx.Ctx(), who, ctx.Param("id"))
+	if err != nil {
+		return err
+	}
+	return ctx.JSON(stdhttp.StatusAccepted, NewDeliveryResource(delivery))
 }
 
 func (m *Module) endpointDeliveries(ctx *fhttp.Context) error {
@@ -312,11 +388,14 @@ func endpointRequest(ctx *fhttp.Context) EndpointRequest {
 	case string:
 		events = strings.Split(v, ",")
 	}
-	active := strings.ToLower(ctx.Input("active"))
+	yes := func(field string) bool {
+		value := strings.ToLower(ctx.Input(field))
+		return value == "1" || value == "true" || value == "on"
+	}
 	return EndpointRequest{
 		Name: ctx.Input("name"), URL: ctx.Input("url"), Events: events,
-		Signer: ctx.Input("signer"), SignatureHeader: ctx.Input("signature_header"), Headers: ctx.Input("headers"),
-		Active: active == "1" || active == "true" || active == "on",
+		Dialect: ctx.Input("dialect"), Signer: ctx.Input("signer"), SignatureHeader: ctx.Input("signature_header"),
+		WithoutAranduHeaders: yes("without_arandu_headers"), Headers: ctx.Input("headers"), Active: yes("active"),
 	}
 }
 
@@ -326,12 +405,28 @@ type secretResource string
 func (s secretResource) ToArray() map[string]any { return map[string]any{"secret": string(s)} }
 func (s secretResource) With() map[string]any    { return nil }
 
-// Schedule declares the daily clean of old received calls, as
-// webhook-client's model:prune of WebhookCall, in each receiver's tenant.
-// CleanSpec "-" declares none.
+// Schedule declares the daily cleans: of old received calls, as
+// webhook-client's model:prune of WebhookCall, in each receiver's tenant; and
+// of the deliveries settled longer ago than Server.Retention, with their
+// attempts, in every tenant. CleanSpec "-" declares none.
 func (m *Module) Schedule() []foundation.Task {
-	if m.cfg.CleanSpec == "-" || len(m.cfg.Receivers) == 0 {
+	if m.cfg.CleanSpec == "-" {
 		return nil
+	}
+	retention := m.cfg.Server.Retention
+	tasks := []foundation.Task{{
+		ID:        "webhook.deliveries.clean",
+		Spec:      m.cfg.CleanSpec,
+		Scope:     foundation.PerTenant,
+		Timeout:   10 * time.Minute,
+		Singleton: true,
+		Action:    DeliveryClean,
+		Run: func(ctx context.Context, g security.Grant) error {
+			return m.sender.clean(ctx, g, m.sender.clock().Add(-retention))
+		},
+	}}
+	if len(m.cfg.Receivers) == 0 {
+		return tasks
 	}
 	seen := map[string]bool{}
 	var tenants []string
@@ -342,7 +437,7 @@ func (m *Module) Schedule() []foundation.Task {
 		}
 	}
 	days := m.cfg.DeleteAfterDays
-	return []foundation.Task{{
+	return append(tasks, foundation.Task{
 		ID:        "webhook.calls.clean",
 		Spec:      m.cfg.CleanSpec,
 		Scope:     foundation.Global,
@@ -360,20 +455,23 @@ func (m *Module) Schedule() []foundation.Task {
 			}
 			return nil
 		},
-	}}
+	})
 }
 
-// Migrations declares the schema this module owns: its two tables, and the
-// deliveries table of hesape/webhook underneath. An application that already
-// runs hesape/webhook's Manager has that migration applied, and the migrator
-// skips a name it has run.
+// Migrations declares the schema this module owns: the endpoints, the
+// received calls, the deliveries and their attempts. The jobs table is the
+// queue's, and the outbox the management events are stored in is hesape's
+// events, both migrated by the application.
 func (m *Module) Migrations() []foundation.Migration {
-	return append([]foundation.Migration{createEndpoints{}, createCalls{}}, m.sender.manager.Migrations()...)
+	return []foundation.Migration{createEndpoints{}, createCalls{}, extendEndpoints{}, createDeliveries{}, createAttempts{}}
 }
 
 var (
 	_ migrations.ReversibleMigration = createEndpoints{}
 	_ migrations.ReversibleMigration = createCalls{}
+	_ migrations.ReversibleMigration = extendEndpoints{}
+	_ migrations.ReversibleMigration = createDeliveries{}
+	_ migrations.ReversibleMigration = createAttempts{}
 )
 
 // createEndpoints is the sending side's endpoints.
@@ -437,4 +535,122 @@ func (createCalls) Up(ctx context.Context, conn migrations.Connection) error {
 // Down drops the table.
 func (createCalls) Down(ctx context.Context, conn migrations.Connection) error {
 	return conn.Schema().DropIfExists(ctx, callsTable)
+}
+
+// extendEndpoints gives the endpoints their dialect, their previous secrets,
+// their own policy and what the engine records when it turns one off. The
+// dialect starts as the signer v0.1.0 wrote; the signer column stays, for a
+// binary of that release during a rollout.
+type extendEndpoints struct{ migrations.BaseMigration }
+
+// GetName is the migration's identity, and it carries the order.
+func (extendEndpoints) GetName() string {
+	return "20261014_0003_add_dialect_and_policy_to_webhook_server_endpoints"
+}
+
+// Up adds the columns and fills them for the rows already there.
+func (extendEndpoints) Up(ctx context.Context, conn migrations.Connection) error {
+	err := conn.Schema().Table(ctx, endpointsTable, func(table *schema.Blueprint) {
+		table.String("dialect", 32).Default(DialectArandu)
+		table.UnsignedSmallInteger("include_arandu_headers").Default(1)
+		table.Text("previous_secrets").Nullable()
+		table.Text("policy").Nullable()
+		table.Integer("consecutive_failures").Default(0)
+		table.Timestamp("disabled_at").Nullable()
+		table.String("disabled_reason", 64).Default("")
+	})
+	if err != nil {
+		return err
+	}
+	_, err = conn.Statement(ctx, "UPDATE "+endpointsTable+" SET dialect = signer, previous_secrets = '', policy = ''", nil)
+	return err
+}
+
+// Down drops the columns.
+func (extendEndpoints) Down(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().Table(ctx, endpointsTable, func(table *schema.Blueprint) {
+		table.DropColumn("dialect", "include_arandu_headers", "previous_secrets", "policy",
+			"consecutive_failures", "disabled_at", "disabled_reason")
+	})
+}
+
+// createDeliveries is the deliveries this module records and attempts.
+type createDeliveries struct{ migrations.BaseMigration }
+
+// GetName is the migration's identity, and it carries the order.
+func (createDeliveries) GetName() string { return "20261014_0004_create_webhook_server_deliveries" }
+
+// Up creates the table.
+func (createDeliveries) Up(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().Create(ctx, deliveriesTable, func(table *schema.Blueprint) {
+		table.String("id", maxDeliveryIDLen).Primary()
+		table.String("tenant_id", maxIdentifierLen)
+		table.String("event_id", maxDeliveryIDLen)
+		table.String("event_name", 255)
+		table.String("endpoint_id", maxIdentifierLen)
+		table.String("url", hwebhook.MaxURLLength)
+		table.String("dialect", 32)
+		table.MediumText("body")
+		table.String("body_sha256", 64)
+		table.Text("headers")
+		table.String("secret_ref", 128)
+		table.String("signature_header", 64).Default("")
+		table.UnsignedSmallInteger("include_arandu_headers").Default(1)
+		table.String("status", 16)
+		table.Integer("attempts").Default(0)
+		table.Integer("max_attempts")
+		table.Text("backoff")
+		table.UnsignedSmallInteger("permanent").Default(0)
+		table.Timestamp("next_attempt_at").Nullable()
+		table.Integer("response_status").Nullable()
+		table.Text("last_error").Nullable()
+		table.String("claim_token", maxIdentifierLen).Nullable()
+		table.Timestamp("lease_until").Nullable()
+		table.Timestamp("created_at")
+		table.Timestamp("updated_at")
+		table.Timestamp("delivered_at").Nullable()
+		table.Unique([]string{"tenant_id", "event_id", "endpoint_id"}, "webhook_server_deliveries_event_endpoint_uidx")
+		table.Index([]string{"tenant_id", "endpoint_id", "created_at", "id"}, "webhook_server_deliveries_endpoint_idx")
+		table.Index([]string{"tenant_id", "status", "next_attempt_at"}, "webhook_server_deliveries_due_idx")
+		table.Index([]string{"tenant_id", "created_at"}, "webhook_server_deliveries_retention_idx")
+	})
+}
+
+// Down drops the table.
+func (createDeliveries) Down(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().DropIfExists(ctx, deliveriesTable)
+}
+
+// createAttempts is the history of every attempt of a delivery.
+type createAttempts struct{ migrations.BaseMigration }
+
+// GetName is the migration's identity, and it carries the order.
+func (createAttempts) GetName() string {
+	return "20261014_0005_create_webhook_server_delivery_attempts"
+}
+
+// Up creates the table.
+func (createAttempts) Up(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().Create(ctx, attemptsTable, func(table *schema.Blueprint) {
+		table.String("id", maxIdentifierLen).Primary()
+		table.String("tenant_id", maxIdentifierLen)
+		table.String("delivery_id", maxDeliveryIDLen)
+		table.String("endpoint_id", maxIdentifierLen)
+		table.Integer("attempt")
+		table.String("triggered_by", 16)
+		table.UnsignedSmallInteger("succeeded").Default(0)
+		table.Integer("response_status").Nullable()
+		table.String("error", 64).Default("")
+		table.Text("response")
+		table.BigInteger("duration_ms").Default(0)
+		table.Timestamp("signed_at")
+		table.Timestamp("created_at")
+		table.Unique([]string{"tenant_id", "delivery_id", "attempt"}, "webhook_server_delivery_attempts_uidx")
+		table.Index([]string{"tenant_id", "created_at"}, "webhook_server_delivery_attempts_retention_idx")
+	})
+}
+
+// Down drops the table.
+func (createAttempts) Down(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().DropIfExists(ctx, attemptsTable)
 }

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/arandu-io/framework/foundation"
 	"github.com/arandu-io/framework/security"
 	hwebhook "github.com/arandu-io/hesape/webhook"
 
@@ -267,11 +268,16 @@ func TestTheCleanRemovesOldCalls(t *testing.T) {
 	}
 	w.send(t, signed("/webhooks/billing", `{"old":false}`, sharedSecret))
 
-	tasks := w.module.Schedule()
-	if len(tasks) != 1 || tasks[0].ID != "webhook.calls.clean" {
-		t.Fatalf("the module schedules %v", tasks)
+	var clean *foundation.Task
+	for i, task := range w.module.Schedule() {
+		if task.ID == "webhook.calls.clean" {
+			clean = &w.module.Schedule()[i]
+		}
 	}
-	if err := tasks[0].Run(context.Background(), security.Grant{}); err != nil {
+	if clean == nil {
+		t.Fatalf("the module schedules %v", w.module.Schedule())
+	}
+	if err := clean.Run(context.Background(), security.Grant{}); err != nil {
 		t.Fatal(err)
 	}
 	left := w.calls(t, tenant)

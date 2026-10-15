@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/arandu-io/framework/data"
 	"github.com/arandu-io/framework/security"
@@ -31,8 +32,13 @@ const testKey = "0123456789abcdef0123456789abcdef"
 
 var endpointActions = []security.Action{
 	webhook.EndpointView, webhook.EndpointList, webhook.EndpointCreate, webhook.EndpointUpdate,
-	webhook.EndpointDelete, webhook.EndpointSecret, webhook.EndpointTest,
+	webhook.EndpointDelete, webhook.EndpointSecret, webhook.EndpointTest, webhook.EndpointRotate,
+	webhook.EndpointImport, webhook.DeliveryRedeliver,
 }
+
+// systemActions are the Grants the module issues for itself, and that no
+// subject is allowed even when it carries them.
+var systemActions = []security.Action{webhook.CallReceive, webhook.CallClean, webhook.DeliveryDispatch, webhook.DeliveryClean}
 
 var callActions = []security.Action{webhook.CallView, webhook.CallList, webhook.CallProcess}
 
@@ -52,12 +58,12 @@ func granted(actions ...security.Action) security.Subject {
 func TestThePoliciesDenyEveryActionByDefault(t *testing.T) {
 	t.Parallel()
 
-	for _, action := range append(endpointActions, webhook.CallReceive, webhook.CallClean) {
+	for _, action := range append(append([]security.Action{}, endpointActions...), systemActions...) {
 		if _, err := security.Authorize(context.Background(), webhook.EndpointPolicy{}, administrator(), action, webhook.Endpoint{}); !errors.Is(err, security.ErrForbidden) {
 			t.Fatalf("the endpoint policy allowed %s to a subject never given it: %v", action, err)
 		}
 	}
-	for _, action := range append(callActions, webhook.CallReceive, webhook.CallClean) {
+	for _, action := range append(append([]security.Action{}, callActions...), systemActions...) {
 		if _, err := security.Authorize(context.Background(), webhook.CallPolicy{}, administrator(), action, webhook.Call{}); !errors.Is(err, security.ErrForbidden) {
 			t.Fatalf("the call policy allowed %s to a subject never given it: %v", action, err)
 		}
@@ -82,16 +88,19 @@ func TestThePoliciesAllowWhatTheSubjectWasGiven(t *testing.T) {
 func TestTheSystemActionsAreGivenToNobody(t *testing.T) {
 	t.Parallel()
 
-	// CallReceive and CallClean are the receiver's and the clean's own
-	// Grants. A subject that somehow carried them is still refused.
-	for _, action := range []security.Action{webhook.CallReceive, webhook.CallClean} {
+	// The receiver's, the clean's and the dispatch's own Grants. A subject
+	// that somehow carried them is still refused, by both policies.
+	for _, action := range systemActions {
 		if _, err := security.Authorize(context.Background(), webhook.CallPolicy{}, granted(action), action, webhook.Call{}); !errors.Is(err, security.ErrForbidden) {
-			t.Fatalf("a subject carrying %s was allowed it: %v", action, err)
+			t.Fatalf("a subject carrying %s was allowed it on a call: %v", action, err)
+		}
+		if _, err := security.Authorize(context.Background(), webhook.EndpointPolicy{}, granted(action), action, webhook.Endpoint{}); !errors.Is(err, security.ErrForbidden) {
+			t.Fatalf("a subject carrying %s was allowed it on an endpoint: %v", action, err)
 		}
 	}
 	for _, action := range webhook.Actions() {
-		if action == webhook.CallReceive || action == webhook.CallClean {
-			t.Fatalf("Actions offers the system action %s to be given to people", action)
+		if slices.Contains(systemActions, action) || action == webhook.EndpointImport {
+			t.Fatalf("Actions offers %s, which is not given to people", action)
 		}
 	}
 }
@@ -148,13 +157,23 @@ func TestTheServicesRefuseBeforeReachingTheModel(t *testing.T) {
 	ctx, who := context.Background(), administrator()
 
 	for name, call := range map[string]func() error{
-		"Endpoint.List":       func() error { _, err := endpoints.List(ctx, who, data.Query{}); return err },
-		"Endpoint.Find":       func() error { _, err := endpoints.Find(ctx, who, "e-1"); return err },
-		"Endpoint.Update":     func() error { _, err := endpoints.Update(ctx, who, "e-1", validRequest()); return err },
-		"Endpoint.Delete":     func() error { return endpoints.Delete(ctx, who, "e-1") },
-		"Endpoint.Secret":     func() error { _, err := endpoints.Secret(ctx, who, "e-1"); return err },
-		"Endpoint.Headers":    func() error { _, err := endpoints.HeaderNames(ctx, who, "e-1"); return err },
-		"Endpoint.Test":       func() error { return endpoints.Test(ctx, who, "e-1") },
+		"Endpoint.List":      func() error { _, err := endpoints.List(ctx, who, data.Query{}); return err },
+		"Endpoint.Find":      func() error { _, err := endpoints.Find(ctx, who, "e-1"); return err },
+		"Endpoint.Update":    func() error { _, err := endpoints.Update(ctx, who, "e-1", validRequest()); return err },
+		"Endpoint.Delete":    func() error { return endpoints.Delete(ctx, who, "e-1") },
+		"Endpoint.Secret":    func() error { _, err := endpoints.Secret(ctx, who, "e-1"); return err },
+		"Endpoint.Headers":   func() error { _, err := endpoints.HeaderNames(ctx, who, "e-1"); return err },
+		"Endpoint.Test":      func() error { _, err := endpoints.Test(ctx, who, "e-1"); return err },
+		"Endpoint.Rotate":    func() error { _, err := endpoints.Rotate(ctx, who, "e-1", time.Hour); return err },
+		"Endpoint.Enable":    func() error { _, err := endpoints.Enable(ctx, who, "e-1"); return err },
+		"Endpoint.Disable":   func() error { _, err := endpoints.Disable(ctx, who, "e-1"); return err },
+		"Endpoint.Delivery":  func() error { _, err := endpoints.Delivery(ctx, who, "d-1"); return err },
+		"Endpoint.Attempts":  func() error { _, err := endpoints.Attempts(ctx, who, "d-1"); return err },
+		"Endpoint.Redeliver": func() error { _, err := endpoints.Redeliver(ctx, who, "d-1"); return err },
+		"Endpoint.Import": func() error {
+			_, err := endpoints.Import(ctx, who, webhook.ImportRequest{ID: "e-1", EndpointRequest: validRequest(), Secret: testKey})
+			return err
+		},
 		"Endpoint.Deliveries": func() error { _, err := endpoints.Deliveries(ctx, who, "e-1", 10); return err },
 		"Endpoint.Create":     func() error { _, _, err := endpoints.Create(ctx, who, validRequest()); return err },
 		"Call.List":           func() error { _, err := calls.List(ctx, who, webhook.CallFilter{}, data.Query{}); return err },
@@ -265,7 +284,7 @@ func TestTheTablesAreWiredAndTenantScoped(t *testing.T) {
 	}
 
 	deliveryHandle := newRecordingHandle()
-	if name := webhook.Deliveries(deliveryHandle).Base().Table().Name(); name != "webhook_deliveries" {
+	if name := webhook.Deliveries(deliveryHandle).Base().Table().Name(); name != "webhook_server_deliveries" {
 		t.Fatalf("Deliveries reads %q", name)
 	}
 	if _, err := webhook.Deliveries(deliveryHandle).Get(ctx, write); err != nil {
@@ -274,6 +293,18 @@ func TestTheTablesAreWiredAndTenantScoped(t *testing.T) {
 	read = deliveryHandle.first(t, "select")
 	if !strings.Contains(read.sql, "tenant_id") || !slices.Contains(read.bindings, any("acme")) {
 		t.Fatalf("the delivery read %q %v is not filtered by the Grant's tenant", read.sql, read.bindings)
+	}
+
+	attemptHandle := newRecordingHandle()
+	if name := webhook.DeliveryAttempts(attemptHandle).Base().Table().Name(); name != "webhook_server_delivery_attempts" {
+		t.Fatalf("DeliveryAttempts reads %q", name)
+	}
+	if _, err := webhook.DeliveryAttempts(attemptHandle).Get(ctx, write); err != nil {
+		t.Fatal(err)
+	}
+	read = attemptHandle.first(t, "select")
+	if !strings.Contains(read.sql, "tenant_id") || !slices.Contains(read.bindings, any("acme")) {
+		t.Fatalf("the attempt read %q %v is not filtered by the Grant's tenant", read.sql, read.bindings)
 	}
 }
 
@@ -325,6 +356,14 @@ func TestTheConfigurationRefusesWhatCannotWork(t *testing.T) {
 		"short named secret":         {Key: key, Server: webhook.Server{Secrets: map[string]string{"partners": "short"}}},
 		"bad named secret":           {Key: key, Server: webhook.Server{Secrets: map[string]string{"Partners!": testKey}}},
 		"bad header prefix":          {Key: key, Server: webhook.Server{HeaderPrefix: "X Acme"}},
+		"policy without tries":       {Key: key, Server: webhook.Server{Policy: &webhook.Policy{Timeout: time.Second, MaxRequestBytes: 1}}},
+		"policy beside a timeout":    {Key: key, Server: webhook.Server{Policy: policyWith(func(p *webhook.Policy) {}), Timeout: time.Second}},
+		"policy with no wait":        {Key: key, Server: webhook.Server{Policy: policyWith(func(p *webhook.Policy) { p.Backoff = nil })}},
+		"policy with a long wait":    {Key: key, Server: webhook.Server{Policy: policyWith(func(p *webhook.Policy) { p.Backoff = []time.Duration{webhook.MaxBackoff + 1} })}},
+		"policy with no timeout":     {Key: key, Server: webhook.Server{Policy: policyWith(func(p *webhook.Policy) { p.Timeout = 0 })}},
+		"policy with a huge body":    {Key: key, Server: webhook.Server{Policy: policyWith(func(p *webhook.Policy) { p.MaxRequestBytes = webhook.MaxRequestBytes + 1 })}},
+		"policy with a bad retry":    {Key: key, Server: webhook.Server{Policy: policyWith(func(p *webhook.Policy) { p.Retry = "sometimes" })}},
+		"policy with a bad agent":    {Key: key, Server: webhook.Server{Policy: policyWith(func(p *webhook.Policy) { p.UserAgent = "a\nb" })}},
 		"receiver without a name":    receiver(webhook.Receiver{Tenant: "acme", Secret: testKey}),
 		"receiver without a tenant":  receiver(webhook.Receiver{Name: "billing", Secret: testKey}),
 		"receiver without a secret":  receiver(webhook.Receiver{Name: "billing", Tenant: "acme"}),
@@ -342,5 +381,26 @@ func TestTheConfigurationRefusesWhatCannotWork(t *testing.T) {
 
 	if err := (webhook.Config{Key: key}).Validate(); err != nil {
 		t.Fatalf("the smallest configuration was refused: %v", err)
+	}
+	if err := (webhook.Config{Key: key, Server: webhook.Server{Policy: policyWith(func(*webhook.Policy) {})}}).Validate(); err != nil {
+		t.Fatalf("the default policy, written out, was refused: %v", err)
+	}
+}
+
+// policyWith is the default policy with one change.
+func policyWith(change func(*webhook.Policy)) *webhook.Policy {
+	p := webhook.DefaultPolicy()
+	change(&p)
+	return &p
+}
+
+func TestTheDefaultPolicyIsTheOneV010Delivered(t *testing.T) {
+	t.Parallel()
+
+	p := webhook.DefaultPolicy()
+	if p.Tries != 5 || !slices.Equal(p.Backoff, []time.Duration{5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute}) ||
+		!p.HonorRetryAfter || p.Retry != webhook.RetryTransient || p.HTTPSOnly || p.MaxRedirects != 5 ||
+		p.Timeout != webhook.DefaultTimeout || p.UserAgent != webhook.DefaultUserAgent || p.DisableAfter != 0 {
+		t.Fatalf("the default policy is %+v", p)
 	}
 }

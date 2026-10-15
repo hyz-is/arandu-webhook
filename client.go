@@ -113,15 +113,16 @@ type receiver struct {
 // client is the receiving side.
 type client struct {
 	db        *data.DB
+	audit     *auditor
 	queue     *queue.DatabaseQueue
 	queueName string
 	receivers map[string]*receiver
 	now       func() time.Time
 }
 
-func newClient(db *data.DB, cfg Config) *client {
+func newClient(db *data.DB, cfg Config, audit *auditor) *client {
 	c := &client{
-		db: db, queue: queue.NewDatabaseQueue(db), queueName: cfg.Server.Queue,
+		db: db, audit: audit, queue: queue.NewDatabaseQueue(db), queueName: cfg.Server.Queue,
 		receivers: map[string]*receiver{}, now: func() time.Time { return time.Now().UTC() },
 	}
 	for _, r := range cfg.Receivers {

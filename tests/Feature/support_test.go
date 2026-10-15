@@ -17,6 +17,8 @@ import (
 	"github.com/arandu-io/framework/security"
 	hedatabase "github.com/arandu-io/hesape/database"
 	sqliteconnector "github.com/arandu-io/hesape/database/connectors/sqlite"
+	"github.com/arandu-io/hesape/database/migrations"
+	"github.com/arandu-io/hesape/events"
 	"github.com/arandu-io/hesape/queue"
 
 	webhook "github.com/hyz-is/arandu-webhook"
@@ -39,6 +41,7 @@ type world struct {
 	worker   *queue.Worker
 	jobs     *queue.DatabaseQueue
 	handled  *handled
+	schema   migrations.Connection
 }
 
 // handled is what the test processors saw.
@@ -95,7 +98,7 @@ func install(t *testing.T, configure func(*webhook.Config, *handled)) *world {
 	}
 	jobs := queue.NewDatabaseQueue(db)
 	schema := hedatabase.ForMigrations(connection)
-	for _, m := range append(jobs.Migrations(), module.Migrations()...) {
+	for _, m := range append(append(jobs.Migrations(), events.NewModule().Migrations()...), module.Migrations()...) {
 		if err := m.Up(context.Background(), schema); err != nil {
 			t.Fatalf("applying %s: %v", m.GetName(), err)
 		}
@@ -106,7 +109,7 @@ func install(t *testing.T, configure func(*webhook.Config, *handled)) *world {
 	}
 	router := fhttp.NewRouter()
 	module.Routes(router.ForModule(module.Name()))
-	return &world{db: db, module: module, sessions: sessions, router: router, worker: worker, jobs: jobs, handled: h}
+	return &world{db: db, module: module, sessions: sessions, router: router, worker: worker, jobs: jobs, handled: h, schema: schema}
 }
 
 // work runs the next job on the webhooks queue and answers the handler's

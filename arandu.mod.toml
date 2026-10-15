@@ -10,14 +10,15 @@ framework = ">= 0.56"
 profiles = ["conventional", "performance"]
 
 [permissions]
-# It sends webhooks: the deliveries leave the process through hesape/webhook's
-# Manager, on a transport that refuses private and loopback addresses.
+# It sends webhooks: every attempt of a delivery leaves the process through
+# hesape's guarded HTTP client, on a transport that refuses loopback, private,
+# link-local and shared (100.64.0.0/10) addresses.
 network = true
 # It keeps no state outside the database.
 filesystem = false
 # It runs no other program.
 exec = false
-# module.go owns the webhook_server_endpoints and webhook_client_calls tables,
-# and returns hesape/webhook's webhook_deliveries migration, so whoever
+# module.go owns webhook_server_endpoints, webhook_server_deliveries,
+# webhook_server_delivery_attempts and webhook_client_calls, so whoever
 # installs this has to run `aru migrate`.
 migrations = true

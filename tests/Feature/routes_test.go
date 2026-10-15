@@ -129,6 +129,12 @@ var everyRoute = []struct {
 	{http.MethodGet, webhook.DefaultPrefix + "/endpoints/e-1/secret", ""},
 	{http.MethodPost, webhook.DefaultPrefix + "/endpoints/e-1/test", ""},
 	{http.MethodGet, webhook.DefaultPrefix + "/endpoints/e-1/deliveries", ""},
+	{http.MethodPost, webhook.DefaultPrefix + "/endpoints/e-1/rotate", ""},
+	{http.MethodPost, webhook.DefaultPrefix + "/endpoints/e-1/enable", ""},
+	{http.MethodPost, webhook.DefaultPrefix + "/endpoints/e-1/disable", ""},
+	{http.MethodGet, webhook.DefaultPrefix + "/deliveries/d-1", ""},
+	{http.MethodGet, webhook.DefaultPrefix + "/deliveries/d-1/attempts", ""},
+	{http.MethodPost, webhook.DefaultPrefix + "/deliveries/d-1/redeliver", ""},
 	{http.MethodGet, webhook.DefaultPrefix + "/calls", ""},
 	{http.MethodGet, webhook.DefaultPrefix + "/calls/c-1", ""},
 	{http.MethodPost, webhook.DefaultPrefix + "/calls/c-1/process", ""},
@@ -237,8 +243,11 @@ func TestTheModuleRegistersItsRoutesUnderItsPrefix(t *testing.T) {
 	want := []string{
 		"DELETE /widgets/endpoints/{id}",
 		"GET /widgets/calls", "GET /widgets/calls/{id}",
+		"GET /widgets/deliveries/{id}", "GET /widgets/deliveries/{id}/attempts",
 		"GET /widgets/endpoints", "GET /widgets/endpoints/{id}", "GET /widgets/endpoints/{id}/deliveries", "GET /widgets/endpoints/{id}/secret",
-		"POST /widgets/calls/{id}/process", "POST /widgets/endpoints", "POST /widgets/endpoints/{id}/test",
+		"POST /widgets/calls/{id}/process", "POST /widgets/deliveries/{id}/redeliver", "POST /widgets/endpoints",
+		"POST /widgets/endpoints/{id}/disable", "POST /widgets/endpoints/{id}/enable", "POST /widgets/endpoints/{id}/rotate",
+		"POST /widgets/endpoints/{id}/test",
 		"PUT /widgets/endpoints/{id}",
 	}
 	if len(got) != len(want) || len(got) != len(everyRoute) {

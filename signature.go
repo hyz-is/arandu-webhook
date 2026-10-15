@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -168,4 +169,39 @@ func (s *sealer) open(tenant, id, purpose, sealed string) (string, error) {
 		return "", errSealedElsewhere
 	}
 	return strings.TrimPrefix(plain, prefix), nil
+}
+
+// PreviousSecret is a secret that still signs after a rotation, until it
+// retires.
+type PreviousSecret struct {
+	Secret    string    `json:"secret"`
+	RetiresAt time.Time `json:"retires_at"`
+}
+
+// sealPrevious seals an endpoint's previous secrets; none seals to empty.
+func (s *sealer) sealPrevious(tenant, id string, previous []PreviousSecret) (string, error) {
+	if len(previous) == 0 {
+		return "", nil
+	}
+	encoded, err := json.Marshal(previous)
+	if err != nil {
+		return "", err
+	}
+	return s.seal(tenant, id, "previous-secrets", string(encoded))
+}
+
+// openPrevious opens an endpoint's previous secrets; empty opens to none.
+func (s *sealer) openPrevious(tenant, id, sealed string) ([]PreviousSecret, error) {
+	if sealed == "" {
+		return nil, nil
+	}
+	plain, err := s.open(tenant, id, "previous-secrets", sealed)
+	if err != nil {
+		return nil, err
+	}
+	var out []PreviousSecret
+	if err := json.Unmarshal([]byte(plain), &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }

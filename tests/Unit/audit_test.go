@@ -183,7 +183,7 @@ func TestEveryServiceMethodAuthorizesBeforeTheModel(t *testing.T) {
 var services = map[string]bool{"EndpointService": true, "CallService": true}
 
 // queries are the generated query constructors.
-var queries = map[string]bool{"Endpoints": true, "Calls": true, "Deliveries": true}
+var queries = map[string]bool{"Endpoints": true, "Calls": true, "Deliveries": true, "DeliveryAttempts": true}
 
 // firstModelReach is where a Service first constructs a generated query or
 // calls a promoted write terminal. The constructor itself counts: moving only
@@ -436,9 +436,9 @@ func usedCapabilities(files []parsedGoFile) capabilities {
 					name == "http.NewRequestWithContext",
 					name == "net.Dial", name == "net.DialTimeout",
 					strings.HasSuffix(name, ".Do"), strings.HasSuffix(name, ".RoundTrip"),
-					// hesape/webhook's Manager sends the deliveries it is built
-					// for: constructing one is taking on the network.
-					name == "hwebhook.NewManager":
+					// hesape's client factory builds the client the deliveries
+					// go out on: building one is taking on the network.
+					name == "httpclient.NewFactory":
 					used.network = true
 
 				case name == "os.Open", name == "os.OpenFile", name == "os.Create",
