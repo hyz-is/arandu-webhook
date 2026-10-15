@@ -18,8 +18,10 @@ The two filters on `gofmt` are not preference. `gofmt` is the only tool in the
 chain that ignores build tags, so it reads files the compiler deliberately
 excludes; `testdata/` holds fixtures that are invalid on purpose.
 
-A change to the entity in `model.go` is followed by `aru model:build`, which
-rewrites `EndpointQuery.go`, and the regenerated file goes in the same commit.
+A change to an entity in `model.go` is followed by `aru model:build`, which
+rewrites its `*Query.go` -- `EndpointQuery.go`, `CallQuery.go`,
+`DeliveryQuery.go`, `DeliveryAttemptQuery.go` -- and the regenerated file goes
+in the same commit.
 `aru model:build --check` exits 1 when the committed file is missing, stale or
 edited by hand.
 
@@ -37,6 +39,11 @@ one of them will not be merged, whatever else it improves.
    query string or a header, on any code path, including the read paths.
 4. **`arandu.mod.toml` matches the code.** Adding an outbound call, a file
    write or a process means declaring it there in the same commit.
+
+Two more things a change keeps: this module is the one delivery engine, so a
+dialect or a policy is added here rather than in an application; and a
+management act that changes something or shows a secret stores its event in
+the outbox, in the transaction of the act, so the activity log knows of it.
 
 CRUD stays on `Endpoints(db)` and its generated query. Add a Repository only for
 a specialized complex query, read model, report, export or raw SQL contract; a

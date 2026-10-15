@@ -23,7 +23,7 @@ here rather than at the registration in somebody else's repository.
 
 ## Taking on more than routes
 
-Six interfaces sit beside `Module` in `framework/foundation`, one of which this
+Six interfaces sit beside `Module` in `framework/foundation`, two of which this
 package already implements, and each is opted into the same way — by
 implementing it. Confirm the set for the version in `go.mod` with:
 
@@ -36,7 +36,7 @@ go doc github.com/arandu-io/framework/foundation
 | --- | --- |
 | `Bootable` | prepare state once, at boot |
 | `Background` | run a loop of the module's own |
-| `Schedulable` | declare work for the scheduler |
+| `Schedulable` | declare work for the scheduler — this package implements it: the cleans of calls and of deliveries |
 | `Migratable` | own tables — this package implements it |
 | `Health` | report on the storage it depends on |
 | `Closable` | give resources back at shutdown |
@@ -53,7 +53,7 @@ application's own tree and never opens an installed package.
 **1. Register it in `Routes`, with a name.**
 
 ```go
-	r.Action(stdhttp.MethodDelete, m.cfg.Prefix+"/{id}", m.destroy).Name("webhook.destroy")
+	r.Action(stdhttp.MethodPost, p+"/endpoints/{id}/rotate", m.endpointRotate).Name("webhook.endpoints.rotate")
 ```
 
 Below the line that is already there, and nowhere above it:
@@ -85,9 +85,9 @@ asserts every route is tagged with the module name, which is what
 service, answer:
 
 ```go
-func (m *Module) destroy(ctx *fhttp.Context) error {
+func (m *Module) endpointDestroy(ctx *fhttp.Context) error {
 	who, _ := ctx.User()
-	if err := m.svc.Delete(ctx.Ctx(), who, ctx.Param("id")); err != nil {
+	if err := m.endpoints.Delete(ctx.Ctx(), who, ctx.Param("id")); err != nil {
 		return err
 	}
 	return ctx.Status(stdhttp.StatusNoContent)
@@ -170,14 +170,17 @@ default visible there:
 
 ```go
 var endpointTable = model.NewTable(model.TableSpec{
-	Name:      "webhooks",
+	Name:      endpointsTable,
 	New:       func() model.Entity { return new(Endpoint) },
 	ManualKey: true,
 })
 ```
 
-`ManualKey` because the key is text the service writes from `data.NewID()`: the
-database neither increments it nor fills it. Do not set `Global: true`: this
+`ManualKey` because the key is text the module writes -- from `data.NewID()`,
+or the id a caller chose for a delivery or an imported endpoint: the database
+neither increments it nor fills it. `Call`, `Delivery` and `DeliveryAttempt`
+are declared the same way, by `callTable`, `deliveryTable` and
+`deliveryAttemptTable`. Do not set `Global: true`: this
 package owns tenant data. Model terminals require a Grant and apply `tenant_id`;
 the Service still calls `security.Authorize` first because the Model does not
 decide which Policy action the Grant represents.
@@ -212,16 +215,19 @@ protects come as a pair:
 ```go
 // arandu:begin custom
 
-// CanRename reports whether the record may take this name.
-func (s Endpoint) CanRename(name string) bool { return name != "" && name != s.Name }
+// ShouldDisable reports whether the engine turns the endpoint off: it is
+// active, and disableAfter of its deliveries in a row gave up.
+func (e Endpoint) ShouldDisable(disableAfter int) bool {
+	return disableAfter > 0 && bool(e.Active) && e.ConsecutiveFailures >= disableAfter
+}
 
-// Rename gives the record a new name, and refuses one it cannot take.
-func (s *Endpoint) Rename(name string) error {
-	if !s.CanRename(name) {
-		return fmt.Errorf("webhook: %q cannot be the new name of this record", name)
+// Disable turns the endpoint off, and keeps why when the engine did it.
+func (e *Endpoint) Disable(reason string, now time.Time) {
+	e.Active, e.UpdatedAt = false, now
+	if reason != "" {
+		at := now
+		e.DisabledAt, e.DisabledReason = &at, reason
 	}
-	s.Name = name
-	return nil
 }
 
 // arandu:end custom
@@ -240,9 +246,14 @@ func (q *EndpointQuery) Named(name string) *EndpointQuery {
 The Service orchestrates around them: it validates the request, asks the Policy
 for the Grant, calls the rule, and saves with that Grant.
 
-This table declares `created_at` but not `updated_at`. The Hesape Model stamps a
-timestamp only when the entity declares its column, so creation remains correct
-without changing the published migration or disabling timestamps globally.
+`DeliveryAttempt` declares `created_at` and no `updated_at`: an attempt is
+written once. The Hesape Model stamps a timestamp only when the entity declares
+its column, so the other three stamp both and this one only its creation.
+
+A count that two workers move at once is not a rule of the entity: the engine
+moves `consecutive_failures` with the query's `Increment`, and turns an endpoint
+off with an update that requires it to be still on, so two deliveries settling
+together record one turning off, not two.
 
 ## Adding a configuration field
 
@@ -311,7 +322,7 @@ Append it to the slice `Migrations()` returns, and give it a name that sorts
 after the last one:
 
 ```go
-func (createWebhooks) GetName() string { return "20260823_0001_create_webhooks" }
+func (createAttempts) GetName() string { return "20261014_0005_create_webhook_server_delivery_attempts" }
 ```
 
 **The name carries the order and nothing else does.** `TestTheModuleDeclaresItsSchema`
@@ -320,7 +331,7 @@ requires none to be empty, and requires every one to satisfy
 `migrations.ReversibleMigration` — the migrator finds `Down` by type assertion,
 so a `Down` with the wrong signature is a rollback that silently does nothing.
 
-Three rules the existing migration keeps:
+Three rules the migrations keep:
 
 - **A name is fixed once the package is published.** Changing what an applied
   name means leaves the change missing everywhere it already ran, and nothing
@@ -337,3 +348,11 @@ Migrations do not run at boot. `aru migrate` is a step in the installer's
 pipeline, and every migration has to be compatible with the previous binary
 during a rollout: a new column is nullable or has a default, and removing one
 takes two releases.
+
+A migration that changes a published table adds columns that are nullable or
+carry a default, and fills them for the rows already there in the same `Up`:
+`20261014_0003_add_dialect_and_policy_to_webhook_server_endpoints` copies
+v0.1.0's signer into the new dialect and leaves the signer column for a binary
+of the previous release during the rollout.
+`TestTheMigrationsRollBackAndApplyAgain` rolls every migration back and applies
+it again on SQLite.

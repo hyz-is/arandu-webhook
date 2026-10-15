@@ -38,7 +38,9 @@ project: no go.mod, main.go and arandu.toml together"* — it reads applications
 and this is a library.
 
 `aru model:build` is different: it works on a module root, and it is what wrote
-`EndpointQuery.go`. Run it after any change to the entity, and before a release
+`EndpointQuery.go`, `CallQuery.go`, `DeliveryQuery.go` and
+`DeliveryAttemptQuery.go`. Run it after any change to an entity, and before a
+release
 
 ```sh
 aru model:build --check
@@ -49,14 +51,12 @@ edited by hand. It needs the `aru` binary rather than the Go toolchain alone,
 which is why it sits beside the four gates and not among them.
 
 CI runs the same four, and so does the release workflow on the tagged archive.
-Both also run `go vet configure.go` by name while their template sections are
-still in them, because the build tag on that file keeps it out of `./...`.
 
-The template has two build subjects, and both are release gates: the raw clone
-and a clean copy after `configure.go` substitutes every name. Run build, vet,
-and race on both. Preserve a built configurator long enough to invoke it again
-inside the configured copy; it must refuse and the tree hash must be identical
-before and after that refusal.
+This repository is a configured copy of the Arandu package template:
+`configure.go` substituted every name once and is gone, so the template's
+second build subject -- the clean copy a configurator produces -- does not
+exist here, and there is no `go vet configure.go` to run. The four gates are
+the whole list.
 
 ## What the manifest declares, and who reads it
 
@@ -71,7 +71,7 @@ framework = ">= 0.56"
 profiles = ["conventional", "performance"]
 
 [permissions]
-network = false
+network = true
 filesystem = false
 exec = false
 migrations = true
@@ -95,8 +95,11 @@ own code; here both fail the suite, because `go test` has one outcome:
 | `permission-not-used` | warning | the manifest says `true` and nothing does it. Asking for more than you need is how a permission model erodes into everyone declaring everything |
 
 So a dependency or a call added here is a line changed in `arandu.mod.toml` in
-the same commit. `migrations = true` is the one this package already declares,
-and it is what tells an installer to run `aru migrate` before deploying.
+the same commit. `network = true` is declared because every attempt of a
+delivery leaves the process -- the audit sees the client's `.Do` and the
+construction of hesape's client factory -- and `migrations = true` because the
+package owns four tables, which is what tells an installer to run `aru migrate`
+before deploying.
 
 The `framework` line is a floor, and it is a second declaration of something
 `go.mod` already says. Move both together when you bump.
@@ -108,7 +111,12 @@ second `require` is a download and an audit surface for every project that
 installs the package, and the framework's own rule is a core with no third-party
 dependency beyond `golang.org/x/crypto`.
 
-What is already here is the framework and the components module it is built on:
+What is already here is the framework and the components module it is built on.
+hesape is held at the version the framework is built against, not the latest:
+`framework/view` converts hesape's `view.Page` to its own, so a hesape newer
+than the framework's stops every installer that draws pages from compiling.
+`TestTheModuleBuildsBesideTheFrameworkViews` imports `framework/view` in this
+module's build list and fails first when the requirement outgrows it.
 
 ```sh
 export GOWORK=off

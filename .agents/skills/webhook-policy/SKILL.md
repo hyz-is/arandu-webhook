@@ -7,10 +7,13 @@ license: MIT
 # Opening the policy
 
 The two policies allow an action only to a subject that carries it -- the
-actions of `Actions()`, which arandu-permission puts on the Subject -- in the
-subject's own tenant, and never to a guest. Everything else is refused, and
-`CallReceive` and `CallClean` are refused to every subject: they exist only in
-the Grants the receiver and the scheduled clean issue for themselves. There is
+actions of `Actions()`, which arandu-permission puts on the Subject, and
+`EndpointImport`, which a data migration's subject carries and `Actions()` does
+not offer -- in the subject's own tenant, and never to a guest. Everything else
+is refused, and `CallReceive`, `CallClean`, `DeliveryDispatch` and
+`DeliveryClean` are refused to every subject: they exist only in the Grants the
+receiver, the scheduled cleans, the relay, the worker and the application's
+own code issue for themselves. There is
 no permit-all branch, and adding one is the single change that would make every
 application installing this package unsafe while looking like working code.
 
@@ -33,13 +36,22 @@ job, a scheduled task — and in an application's own code `aru doctor` reports 
 as `system-grant-outside-scope` when it appears in a handler, and
 `system-grant-without-tenant` when it is called with an empty tenant. A lint,
 not the type system, and one that never runs over an installed package. Nothing
-here reports it either. This package reaches for it in four places, each with an
+here reports it either. This package reaches for it in six places, each with an
 `//arandu:system-grant` comment that says why: storing a received call, whose
 signature checked against the secret the application configured and whose
 tenant is the Receiver's; queueing its processing in that same tenant; the
-scheduled clean, in the tenants the Receivers name; and the test call, after
-`EndpointPolicy` authorized it, under hesape's dispatch action. Add a fifth only
-with the same kind of reason, written beside it.
+scheduled clean of calls, in the tenants the Receivers name; the Publisher, in
+the tenant the outbox row was committed in; the test call, after
+`EndpointPolicy` authorized it, under `DeliveryDispatch`; and every attempt's
+job, in the tenant the delivery was recorded in, under the same action. Add a
+seventh only with the same kind of reason, written beside it.
+
+The engine has no subject to ask a policy about. `Module.Send`,
+`Outgoing.Dispatch`, the Publisher and the attempt job take a Grant and check it
+for `DeliveryDispatch` before their first query; the Model then scopes every
+statement to its tenant. That check is the engine's authorization, and it is the
+reason `DeliveryDispatch` is given to nobody: a person who carried it could send
+as the application.
 
 The Model requires a Grant and applies its tenant, but it does not decide which
 Policy action that Grant represents. `security.Authorize` before the first
@@ -97,9 +109,12 @@ the message contains `another tenant`, so the sentence is part of the contract.
 The empty `ID` is exempt because it is the candidate that has not been stored
 yet, and it belongs to nobody until it is written with the tenant off the Grant.
 
-**4. Add the action to the test list if you added an action.** `endpointActions`
-and `callActions` in `tests/Unit/policy_test.go` are the whole set the tests
-walk, and `Actions()` is what arandu-permission offers. A list holding four of
+**4. Add the action to the test list if you added an action.** `endpointActions`,
+`callActions` and `systemActions` in `tests/Unit/policy_test.go` are the whole
+set the tests walk, and `Actions()` is what arandu-permission offers. An action
+is `module.verb` and lowercase -- `webhook.endpoint.rotate` -- because that is
+the shape arandu-permission draws its catalogue from, and it is named in a
+released CHANGELOG entry, which `tests/Unit/release_test.go` requires. A list holding four of
 five passes while the fifth is open, which is the only state in which any of
 this matters.
 
@@ -134,6 +149,10 @@ same to the row.
 Every query starts at `Endpoints(s.db)`. The constructor returns one mutable
 query, so a second chain begun from a value held in a variable carries the
 clauses of the first.
+
+A method that changes something, or shows a secret, stores its event with
+`s.audit.record` inside the same `data.Transaction` as the write, and the event
+is added to `audit.go` and to `TestEveryManagementActIsRecordedInTheOutbox`.
 
 The method orchestrates and holds no rule the entity could hold. A rule about
 the record itself — whether it may be renamed, what a transition changes — is a

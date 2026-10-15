@@ -539,7 +539,7 @@ func (createCalls) Down(ctx context.Context, conn migrations.Connection) error {
 
 // extendEndpoints gives the endpoints their dialect, their previous secrets,
 // their own policy and what the engine records when it turns one off. The
-// dialect starts as the signer v0.1.0 wrote; the signer column stays, for a
+// dialect starts as the signer the previous release wrote; the signer column stays, for a
 // binary of that release during a rollout.
 type extendEndpoints struct{ migrations.BaseMigration }
 

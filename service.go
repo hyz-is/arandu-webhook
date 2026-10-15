@@ -41,7 +41,7 @@ type EndpointRequest struct {
 	// Dialect is DialectArandu (empty means it, unless Signer names one),
 	// DialectHMAC or DialectStandardWebhooks.
 	Dialect string
-	// Signer is the v0.1.0 name of Dialect, read when Dialect is empty.
+	// Signer is the previous release's name of Dialect, read when Dialect is empty.
 	Signer string
 	// SignatureHeader is where a DialectHMAC signature goes. Empty means
 	// DefaultSignatureHeader.

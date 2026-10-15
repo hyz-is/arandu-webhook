@@ -34,7 +34,7 @@ type Endpoint struct {
 	// Dialect is how its calls are signed and which headers they carry:
 	// DialectArandu, DialectHMAC or DialectStandardWebhooks.
 	Dialect string `db:"dialect"`
-	// Signer is the column v0.1.0 read the dialect from, kept in step with
+	// Signer is the column the previous release read the dialect from, kept in step with
 	// Dialect for a binary of that release during a rollout: DialectArandu or
 	// DialectHMAC, and DialectArandu for a dialect it does not know. Read
 	// Dialect.
@@ -136,7 +136,7 @@ const (
 	DialectStandardWebhooks = "standard-webhooks"
 )
 
-// The signers of v0.1.0, which are the first two dialects.
+// The signers of the previous release, which are the first two dialects.
 const (
 	// SignerArandu is DialectArandu.
 	SignerArandu = DialectArandu
@@ -329,7 +329,7 @@ func (e Endpoint) Receives(event string) bool {
 	return false
 }
 
-// signerFor is what the v0.1.0 signer column holds for a dialect.
+// signerFor is what the signer column of the previous release holds for a dialect.
 func signerFor(dialect string) string {
 	if dialect == DialectHMAC {
 		return SignerHMAC
