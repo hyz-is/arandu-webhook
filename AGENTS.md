@@ -69,7 +69,7 @@ this one must prove about itself it proves in its own suite or nowhere.
 | | measured with |
 | --- | --- |
 | 17 Go files, one per role and four generated, all in one package at the root | `grep -l '^package webhook' *.go` |
-| 12 test files, 85 tests | `find tests -name '*_test.go'` · `go test -count=1 ./... -v \| grep -c '^--- PASS'` |
+| 13 test files, 86 tests | `find tests -name '*_test.go'` · `go test -count=1 ./... -v \| grep -c '^--- PASS'` |
 | 17 management routes behind RequireAuth, and one route per receiver method | `grep -c 'r.Action' module.go` |
 | 17 actions the policies answer about, 12 of them offered to people | `grep -cE '^\t[A-Za-z]+ +security.Action = ' policy.go` |
 | 3 direct dependencies under `arandu-io`, one of them the SQLite connector the tests run on; hesape held at v0.56, the version framework/view compiles against | `go list -m -f '{{if and (not .Indirect) (not .Main)}}{{.Path}} {{.Version}}{{end}}' all` |

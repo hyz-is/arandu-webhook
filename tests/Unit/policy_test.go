@@ -381,6 +381,7 @@ func TestTheConfigurationRefusesWhatCannotWork(t *testing.T) {
 		"a mount that is relative":                receiver(webhook.Receiver{Name: "lpr", Resolve: resolver, Mount: "lpr/{key}"}),
 		"a mount in the framework's namespace":    receiver(webhook.Receiver{Name: "lpr", Resolve: resolver, Mount: "/_arandu/lpr"}),
 		"a path that is not a pattern":            receiver(webhook.Receiver{Name: "lpr", Resolve: resolver, Path: "lpr/{key"}),
+		"an unknown refusal body":                 receiver(webhook.Receiver{Name: "lpr", Resolve: resolver, RefusalBody: "html"}),
 		"a refusal that is not one":               receiver(webhook.Receiver{Name: "lpr", Resolve: resolver, Statuses: webhook.Statuses{Unresolved: 200}}),
 		"both processors": receiver(webhook.Receiver{Name: "lpr", Resolve: resolver,
 			ProcessSync: webhook.SyncProcessorFunc(func(context.Context, security.Grant, *webhook.Call) (webhook.ProcessResult, error) {

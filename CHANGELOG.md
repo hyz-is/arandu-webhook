@@ -35,6 +35,12 @@ missing.
   -- including the ones `StoreHeaders` does not keep.
 - `Receiver.URL` (`URLMode`: `URLFull`, `URLRoute`, `URLNone`): how a call
   keeps the address it arrived at.
+- `Receiver.RefusalBody` (`RefusalMode`): `RefusalText`, the default, answers
+  a receiver's refusals through the router with the status's sentence, as
+  before; `RefusalEmpty` answers every refusal of the receiver -- unresolved,
+  invalid signature, empty, too large, unreadable, unavailable, failed -- with
+  the status alone, exactly what a handler that only calls `WriteHeader`
+  answers.
 - The migration
   `20261015_0007_add_remote_addr_and_headers_digest_to_webhook_client_calls`.
 

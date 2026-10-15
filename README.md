@@ -457,6 +457,13 @@ the queue.
 | a resolver that cannot answer | `Unavailable` | 503 |
 | a `ProcessSync` error | `Failed` | 500 |
 
+A refusal is answered through the router by default (`RefusalBody:
+webhook.RefusalText`): the status and its standard sentence, or a problem
+document to a request that wants JSON. `RefusalBody: webhook.RefusalEmpty`
+answers it with the status alone and no body -- byte for byte what a handler
+that only calls `w.WriteHeader(status)` answers -- for a sender, or an
+application moving its own receiver here, that expects an empty refusal.
+
 Every call keeps who connected (`Call.RemoteAddr`) and `Call.HeadersSHA256`,
 the `HeadersDigest` of every header it arrived with, whatever `StoreHeaders`
 keeps. A `SyncProcessor` also reads every header of the request with

@@ -236,11 +236,23 @@ func (c *client) address(r *http.Request, rc *receiver) (addressed, error) {
 	return out, nil
 }
 
-// receive is webhook-client's WebhookProcessor: the record the call is
+// receive answers a call, and a refusal as the receiver's RefusalBody says:
+// returned for the router to answer, or written as the status alone.
+func (c *client) receive(w http.ResponseWriter, r *http.Request, rc *receiver) error {
+	err := c.take(w, r, rc)
+	var refused statusError
+	if rc.RefusalBody == RefusalEmpty && errors.As(err, &refused) {
+		w.WriteHeader(refused.status)
+		return nil
+	}
+	return err
+}
+
+// take is webhook-client's WebhookProcessor: the record the call is
 // addressed to, the signature, the profile, the stored call and its
 // processing, the answer. A validator that reads only headers is asked
 // before the body is read, so a call it refuses is refused whatever its body.
-func (c *client) receive(w http.ResponseWriter, r *http.Request, rc *receiver) error {
+func (c *client) take(w http.ResponseWriter, r *http.Request, rc *receiver) error {
 	to, err := c.address(r, rc)
 	if err != nil {
 		return err

@@ -244,6 +244,12 @@ type Receiver struct {
 	// default.
 	Statuses Statuses
 
+	// RefusalBody is what a refusal of this receiver carries: RefusalText,
+	// the default, answers the status's standard sentence as the router
+	// does; RefusalEmpty answers the status alone, as a handler that only
+	// calls WriteHeader does.
+	RefusalBody RefusalMode
+
 	// URL is how the address a call arrived at is kept on it. Empty keeps
 	// the full address of a receiver whose route has no parameter, and only
 	// the route -- its parameters as {name}, no query -- of one whose route
@@ -368,6 +374,17 @@ func (r Receiver) route(receivePrefix string) string {
 	return receivePrefix + "/" + r.Name
 }
 
+// RefusalMode is what a receiver's refusals carry.
+type RefusalMode string
+
+const (
+	// RefusalText answers a refusal through the router: the status and its
+	// standard sentence, or a problem document to a request that wants JSON.
+	RefusalText RefusalMode = "text"
+	// RefusalEmpty answers a refusal with its status and no body.
+	RefusalEmpty RefusalMode = "empty"
+)
+
 // URLMode is how a received call keeps the address it arrived at.
 type URLMode string
 
@@ -447,6 +464,11 @@ func (r Receiver) validate() error {
 	if r.Mount != "" && (!strings.HasPrefix(r.Mount, "/") || strings.HasSuffix(r.Mount, "/") ||
 		r.Mount == reservedPrefix || strings.HasPrefix(r.Mount, reservedPrefix+"/")) {
 		return fmt.Errorf("receiver %q: Mount %q is an absolute path, not ending in / and not under %s", r.Name, r.Mount, reservedPrefix)
+	}
+	switch r.RefusalBody {
+	case "", RefusalText, RefusalEmpty:
+	default:
+		return fmt.Errorf("receiver %q: RefusalBody %q is not RefusalText or RefusalEmpty", r.Name, r.RefusalBody)
 	}
 	switch r.URL {
 	case "", URLFull, URLRoute, URLNone:
