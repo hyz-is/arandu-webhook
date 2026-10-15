@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## v0.4.1
+
+The package moved into hesape. To move an application:
+
+1. Replace the import `github.com/hyz-is/arandu-webhook` with
+   `github.com/arandu-io/hesape/webhook` and require hesape v0.59.0 and
+   framework v0.57.0.
+2. Call `webhook.New(cfg, db, middleware.RequireAuth(sessions))` instead of
+   passing the session store; `nil` still mounts no management routes.
+3. Register `fwebhook.NewModule(mod)` from `github.com/arandu-io/framework/webhook`
+   in `k.Register`.
+4. Keep `middleware.CSRFExcept(mod.ReceivePaths()...)`.
+
+The migration names and the sealing key are the same, so a database that ran
+this module's migrations sees nothing pending and its sealed secrets still
+open.
+
 ## v0.4.0
 
 No signature changes. Run `aru migrate` for

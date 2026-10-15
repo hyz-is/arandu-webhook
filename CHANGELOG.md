@@ -10,6 +10,14 @@ a release is corrected by another release and never by moving a tag.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-15
+
+### Deprecated
+
+- The module moved into github.com/arandu-io/hesape/webhook (hesape v0.59.0),
+  with the same exported names, migration names and wire. `go.mod` carries the
+  deprecation, so `go get` and `go list -u` say so.
+
 ## [0.4.0] - 2026-10-15
 
 What the first application to move its webhooks into the module found

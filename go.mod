@@ -1,3 +1,5 @@
+// Deprecated: moved into github.com/arandu-io/hesape/webhook, where webhooks
+// are native and have one delivery engine. Install hesape v0.59.0 or later.
 module github.com/hyz-is/arandu-webhook
 
 go 1.26.0

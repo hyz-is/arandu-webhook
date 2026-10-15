@@ -4,6 +4,12 @@
 
 # Arandu Webhook
 
+> **Moved into hesape.** Webhooks are now native in
+> [`github.com/arandu-io/hesape/webhook`](https://github.com/arandu-io/hesape/tree/main/webhook)
+> (hesape v0.59.0), with the same names, migrations and wire, and one delivery
+> engine. Register it on the framework router with `framework/webhook`
+> (framework v0.57.0). This repository is archived; see UPGRADE.md for the move.
+
 Webhooks both ways for an Arandu application, in one package: what
 [spatie/laravel-webhook-server](https://github.com/spatie/laravel-webhook-server)
 and [spatie/laravel-webhook-client](https://github.com/spatie/laravel-webhook-client)
