@@ -297,7 +297,8 @@ is given one more; one whose attempt is in progress is refused with 409.
 
 An endpoint turned off -- by a person with `Disable`, or by the engine after
 `DisableAfter` deliveries in a row gave up -- keeps its deliveries waiting;
-`Enable` sends them, and a delivered one resets the count. A redelivery and a
+`Enable`, or an `Update` that turns it on, sends them and clears the count, and
+a delivered one resets the count too. A redelivery and a
 test go whatever the endpoint's state. The deliveries of a deleted endpoint
 fail as `endpoint_deleted`. Settled deliveries and their attempts are removed
 after `Server.Retention`, 30 days by default, by the scheduled
@@ -333,7 +334,8 @@ _, err := webhookModule.EndpointService().Import(ctx, migrationSubject, webhook.
 
 The secrets are sealed with this module's key, bound to the tenant and the id.
 `EndpointImport` is the data migration's action: `Actions()` does not offer it,
-and the subject the migration runs as carries it.
+and the subject the migration runs as carries it. Previous secrets already
+retired are dropped, and at most `MaxPreviousSecrets` (5) are kept.
 
 ## Receiving
 

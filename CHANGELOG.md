@@ -53,8 +53,9 @@ this module's, built from hesape's pieces (the guarded HTTP client, the queue,
   retires, one already retiring is revoked), `Import` (`ImportRequest` and
   `PreviousSecret`: an endpoint stored with the id and secrets it already
   has), `Enable` and `Disable` (deliveries wait while an endpoint is off and
-  go when it is on again), `Delivery`, `Attempts` and `Redeliver` (the same id
-  and body, a new timestamp and signature). `ErrEndpointExists`,
+  go when it is on again; turning one on from `Update` does the same),
+  `Delivery`, `Attempts` and `Redeliver` (the same id and body, a new timestamp
+  and signature). An import keeps at most `MaxPreviousSecrets`. `ErrEndpointExists`,
   `ErrDeliveryInProgress`, `ErrNotRedeliverable`, `ErrDeliveryIDTaken`,
   `ErrInvalidMessage`, `ErrPayloadTooLarge`, `ErrHTTPSRequired`, the
   `Failure*` codes and `DefaultRotationOverlap`.

@@ -950,3 +950,57 @@ func TestTheMigrationsRollBackAndApplyAgain(t *testing.T) {
 		t.Fatalf("after the schema was applied again: %v", err)
 	}
 }
+
+func TestTurningAnEndpointOnFromItsFormSendsWhatWaited(t *testing.T) {
+	t.Parallel()
+	clk := newClock(epoch)
+	tg := newTarget(t, true)
+	w := strictWorld(t, tg, clk, nil)
+	ctx := context.Background()
+	importStandard(t, w, "ep_merchant_1", tg.baseURL+"/hooks", stdSecret)
+	if _, err := w.module.EndpointService().Disable(ctx, manager(tenant), "ep_merchant_1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.module.Send(ctx, dispatch(tenant), "ep_merchant_1", webhook.Message{ID: stdMessageID, Event: "invoice.paid", Body: []byte(stdBody)}); err != nil {
+		t.Fatal(err)
+	}
+	w.drain(t)
+	if len(tg.requests()) != 0 {
+		t.Fatal("a delivery to an endpoint turned off went out")
+	}
+	if _, err := w.module.EndpointService().Update(ctx, manager(tenant), "ep_merchant_1", webhook.EndpointRequest{
+		Name: "Merchant", URL: tg.baseURL + "/hooks", Events: []string{"*"}, Dialect: webhook.DialectStandardWebhooks, Active: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	w.drain(t)
+	if row := w.delivery(t, stdMessageID); row.Status != webhook.DeliveryDelivered || len(tg.requests()) != 1 {
+		t.Fatalf("after the form turned the endpoint on the delivery is %s, %d requests", row.Status, len(tg.requests()))
+	}
+}
+
+func TestARowThePreviousReleaseWritesReadsBack(t *testing.T) {
+	t.Parallel()
+	tg := newTarget(t, false)
+	w := install(t, func(c *webhook.Config, _ *handled) { c.Server.HTTPClient = tg.srv.Client() })
+	ctx := context.Background()
+	created, _, err := w.module.EndpointService().Create(ctx, manager(tenant), webhook.EndpointRequest{
+		Name: "Template", URL: tg.baseURL + "/hooks", Events: []string{"*"}, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What a binary of the previous release inserts during a rollout: only
+	// the columns it knows, the sealed secret copied from a row of its own.
+	stored := w.endpoint(t, created.ID)
+	if _, err := w.db.ExecContext(ctx, `INSERT INTO webhook_server_endpoints
+		(id, tenant_id, name, url, events, signer, signature_header, secret, headers, active, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"old-1", tenant, "Old", tg.baseURL+"/old", "*", "hmac", "Signature", stored.Secret, "", 1, time.Now().UTC(), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	old := w.endpoint(t, "old-1")
+	if old.Dialect != webhook.DialectArandu || old.PreviousSecrets != "" || old.Policy != "" || !bool(old.AranduHeaders) {
+		t.Fatalf("a row of the previous release reads back as %+v", old)
+	}
+}

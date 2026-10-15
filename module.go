@@ -538,9 +538,10 @@ func (createCalls) Down(ctx context.Context, conn migrations.Connection) error {
 }
 
 // extendEndpoints gives the endpoints their dialect, their previous secrets,
-// their own policy and what the engine records when it turns one off. The
-// dialect starts as the signer the previous release wrote; the signer column stays, for a
-// binary of that release during a rollout.
+// their own policy and what the engine records when it turns one off. Every
+// column has a default, so a row a binary of the previous release writes during
+// a rollout reads back; the dialect starts as the signer that release wrote,
+// and the signer column stays.
 type extendEndpoints struct{ migrations.BaseMigration }
 
 // GetName is the migration's identity, and it carries the order.
@@ -553,8 +554,8 @@ func (extendEndpoints) Up(ctx context.Context, conn migrations.Connection) error
 	err := conn.Schema().Table(ctx, endpointsTable, func(table *schema.Blueprint) {
 		table.String("dialect", 32).Default(DialectArandu)
 		table.UnsignedSmallInteger("include_arandu_headers").Default(1)
-		table.Text("previous_secrets").Nullable()
-		table.Text("policy").Nullable()
+		table.String("previous_secrets", maxSealedLen).Default("")
+		table.String("policy", maxSealedLen).Default("")
 		table.Integer("consecutive_failures").Default(0)
 		table.Timestamp("disabled_at").Nullable()
 		table.String("disabled_reason", 64).Default("")
@@ -562,7 +563,7 @@ func (extendEndpoints) Up(ctx context.Context, conn migrations.Connection) error
 	if err != nil {
 		return err
 	}
-	_, err = conn.Statement(ctx, "UPDATE "+endpointsTable+" SET dialect = signer, previous_secrets = '', policy = ''", nil)
+	_, err = conn.Statement(ctx, "UPDATE "+endpointsTable+" SET dialect = signer", nil)
 	return err
 }
 

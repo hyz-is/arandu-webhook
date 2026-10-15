@@ -313,7 +313,8 @@ func (s *EndpointService) effective(asked *Policy, record *Endpoint) Policy {
 }
 
 // Update changes an endpoint. The secret stays, and empty headers keep the
-// stored ones. A change to DialectStandardWebhooks needs a secret that
+// stored ones. Turning it on here is turning it on with Enable: the count
+// of failures is cleared, and the deliveries it kept waiting go. A change to DialectStandardWebhooks needs a secret that
 // dialect can sign with: rotate first when the endpoint's is not one.
 func (s *EndpointService) Update(ctx context.Context, actor security.Subject, id string, in EndpointRequest) (*Endpoint, error) {
 	valid, errs := s.validate(in)
@@ -345,13 +346,22 @@ func (s *EndpointService) Update(ctx context.Context, actor security.Subject, id
 	if errs.Any() {
 		return nil, errs
 	}
-	before := endpointFacts(record)
+	before, was := endpointFacts(record), bool(record.Active)
 	if err := s.apply(record, valid, strings.TrimSpace(in.Headers) == ""); err != nil {
 		return nil, err
+	}
+	turnedOn := !was && bool(record.Active)
+	if turnedOn {
+		record.Enable(s.sender.clock())
 	}
 	err = data.Transaction(ctx, s.db, func(ctx context.Context) error {
 		if _, err := record.Save(ctx, g); err != nil {
 			return err
+		}
+		if turnedOn {
+			if err := s.sender.resume(ctx, g, record); err != nil {
+				return err
+			}
 		}
 		return s.audit.record(ctx, g, EventEndpointUpdated, aggregateEndpoint, record.ID, map[string]any{
 			"before": before, "after": endpointFacts(record),
@@ -530,6 +540,9 @@ func (s *EndpointService) Import(ctx context.Context, actor security.Subject, in
 	checkSecret(errs, "secret", valid.Dialect, in.Secret)
 	for _, p := range in.PreviousSecrets {
 		checkSecret(errs, "previous_secrets", valid.Dialect, p.Secret)
+	}
+	if len(in.PreviousSecrets) > MaxPreviousSecrets {
+		errs.Add("previous_secrets", "Keep at most 5 previous secrets.")
 	}
 	if errs.Any() {
 		return nil, errs

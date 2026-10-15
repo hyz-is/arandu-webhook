@@ -299,6 +299,15 @@ const (
 // caller may choose.
 const maxDeliveryIDLen = 128
 
+// maxSealedLen is the width of an endpoint's sealed previous secrets and of
+// its policy, which are short enough for a column with a default on every
+// engine.
+const maxSealedLen = 2048
+
+// MaxPreviousSecrets is how many previous secrets an endpoint keeps signing
+// with at once.
+const MaxPreviousSecrets = 5
+
 // maxIdentifierLen is the width of an identifier column.
 const maxIdentifierLen = 64
 
