@@ -20,10 +20,13 @@ are in Laravel.
   attempt history. The events outbox delivers through the Publisher, `Send`
   delivers a message the application built, and a call can be built in code,
   as webhook-server's `WebhookCall::create()`.
-- **Receiving.** A receiver per system that calls the application. A call is
-  checked against its signature, offered to a profile, stored with the headers
-  the receiver keeps, answered at once, and processed on the queue by the
-  receiver's processor. Old calls are cleaned on a schedule.
+- **Receiving.** A receiver per system that calls the application, with one
+  tenant and secret from the configuration, or resolving each request to a
+  record of the application -- its tenant, its secrets, its own validator --
+  at the address the sender already uses. A call is checked against its
+  signature, offered to a profile, stored with the headers the receiver keeps,
+  and processed on the queue after a 200, or at once with the processor's
+  answer as the reply. Old calls are cleaned on a schedule.
 - **Recorded.** Every management act -- an endpoint created, changed, removed,
   imported, turned on or off, a secret shown or rotated, a test, a
   redelivery, a call processed again -- stores an event in the application's
@@ -52,15 +55,16 @@ are in Laravel.
 | Spatie | Here |
 | --- | --- |
 | `configs[]` in `config/webhook-client.php` | `Config.Receivers` |
-| `Route::webhooks('url', 'name')` | the receiver's route, `ReceivePrefix + "/" + Name` |
+| `Route::webhooks('url', 'name')` | the receiver's route: `ReceivePrefix + "/" + Name`, or `Path` with parameters under it, or an absolute `Mount` |
 | `signing_secret`, `signature_header_name` | `Receiver.Secret` (and `PreviousSecrets` during a rotation), `HMAC{Header}` |
+| *(one config per URL)* | `Receiver.Resolve`: one receiver for many records, each with its own tenant, secrets and validator, found from the path |
 | `DefaultSignatureValidator` | `HMAC{Header: "Signature"}`, the default; `Prefix` reads `sha256=…` signatures |
-| `SignatureValidator` | `SignatureValidator`, and `Arandu{}` for hesape's scheme with replay protection |
+| `SignatureValidator` | `SignatureValidator`, `Arandu{}` for hesape's scheme, `StandardWebhooks{}`, and `HeaderSecret{}` for a secret sent as it is |
 | `InvalidWebhookSignatureEvent` | `Receiver.OnInvalidSignature` |
 | `WebhookProfile`, `ProcessEverythingWebhookProfile` | `Profile`, `ProcessEverything` |
-| `RespondsToWebhook`, `DefaultRespondsTo` | `Responder`, `RespondOK`: 200 `{"message":"ok"}` |
+| `RespondsToWebhook`, `DefaultRespondsTo` | `Responder`, `RespondOK`: 200 `{"message":"ok"}`; `Statuses` for each refusal |
 | `store_headers` | `Receiver.StoreHeaders`, `"*"` for every header |
-| `process_webhook_job` | `Receiver.Process`, a `Processor` run by the queue |
+| `process_webhook_job` | `Receiver.Process`, a `Processor` run by the queue, or `Receiver.ProcessSync`, run before the answer, which it gives |
 | `WebhookCall` model, `saveException`, `clearException` | `Call`, with `Status`, `Attempts` and `Exception` |
 | `delete_after_days` with `model:prune` | `Config.DeleteAfterDays` and the scheduled `webhook.calls.clean` |
 
@@ -84,7 +88,7 @@ are in Laravel.
 ## Install
 
 ```bash
-go get github.com/hyz-is/arandu-webhook@v0.2.0
+go get github.com/hyz-is/arandu-webhook@v0.3.0
 ```
 
 It needs framework v0.56 and hesape v0.56. It requires no hesape newer than
@@ -136,11 +140,11 @@ Register it with the others:
 	)
 ```
 
-A receiver is called by a system with no session, so its path is exempted from
-the CSRF check:
+A receiver is called by a system with no session, so its paths are exempted
+from the CSRF check -- `ReceivePrefix`, and the fixed part of every `Mount`:
 
 ```go
-	middleware.CSRFProtect(csrf, sessions.IDFromRequest, middleware.CSRFExcept(webhookModule.ReceivePrefix()+"/"))
+	middleware.CSRFProtect(csrf, sessions.IDFromRequest, middleware.CSRFExcept(webhookModule.ReceivePaths()...))
 ```
 
 The events outbox delivers to the endpoints through the publisher, and to the
@@ -354,12 +358,20 @@ var billingWebhooks = webhook.ProcessorFunc(func(ctx context.Context, g security
 
 A call to `POST /webhooks/billing`:
 
-1. is read up to `MaxBodyBytes` (1 MiB), or answered 413;
-2. is checked by the `Validator`, or answered 403 after `OnInvalidSignature`;
-3. is offered to the `Profile`; one it turns down is answered and kept nowhere;
-4. is stored with the headers in `StoreHeaders`, and its processing is queued in
-   the same transaction;
-5. is answered by the `Respond`er, 200 `{"message":"ok"}` by default.
+1. is resolved, when the receiver has `Resolve`, to the record it is addressed
+   to, or answered 404 (`Statuses.Unresolved`);
+2. is checked by a validator that reads only headers, such as `HeaderSecret`,
+   before anything of its body is read;
+3. is read up to `MaxBodyBytes` (1 MiB), or answered 413; a form already read
+   by a middleware is encoded again with `ReencodeForm`;
+4. is checked by the `Validator`, or answered 403 after `OnInvalidSignature`;
+5. is refused when empty, if `Statuses.EmptyBody` says with what;
+6. is offered to the `Profile`; one it turns down is answered and kept nowhere;
+7. is stored with the headers in `StoreHeaders`, in the tenant of its receiver
+   or of its record, and its processing is queued in the same transaction;
+8. is answered by the `Respond`er, 200 `{"message":"ok"}` by default -- or,
+   with `ProcessSync`, processed now and answered with what the processor
+   returned.
 
 The worker then runs the `Processor` with the Grant of the call's tenant. An
 error leaves the call `failed` with its message, and the queue tries again until
@@ -372,10 +384,71 @@ The validators:
 | --- | --- |
 | `HMAC{Header, Prefix}` | the hex HMAC-SHA256 of the body; `Prefix: "sha256="` for GitHub-style headers |
 | `Arandu{HeaderPrefix, Tolerance}` | hesape's scheme, as another Arandu application sends it, refusing a timestamp more than 5 minutes away |
+| `StandardWebhooks{Tolerance}` | `Webhook-Id`, `Webhook-Timestamp` and a `v1` entry of `Webhook-Signature` under a `whsec_` secret, refusing a timestamp more than 5 minutes away |
+| `HeaderSecret{Header}` | a shared secret sent as it is, compared in constant time before the body is read; no secret refuses every call |
 | `SignatureValidatorFunc` | whatever the sender does |
 
 Every validator receives the current secret and the `PreviousSecrets`, so a
 sender can rotate without a gap.
+
+### Receivers addressed to records
+
+A provider that calls one URL per record of the application -- an inbound
+endpoint, an integration key -- is one receiver that resolves the record from
+the path. The path parameter only says which record to look for: the tenant is
+the record's, and the record's secret checked against the signature is what
+admits the call. A receiver can keep an address already published with
+`Mount`:
+
+```go
+webhook.Receiver{
+	Name:     "lpr",
+	Mount:    "/integracoes/lpr/{org}/{key}",
+	Validator: webhook.Arandu{},
+	Resolve: webhook.ResolverFunc(func(r *http.Request) (webhook.Resolution, error) {
+		integration, err := integrations.ByKey(r.Context(), r.PathValue("org"), r.PathValue("key"))
+		if err != nil {
+			return webhook.Resolution{}, err // 404
+		}
+		return webhook.Resolution{
+			Tenant: integration.TenantID, Secret: integration.Secret,
+			PreviousSecrets: integration.Retiring, Reference: integration.ID,
+		}, nil
+	}),
+	MaxBodyBytes: 64 << 10,
+	Statuses:     webhook.Statuses{InvalidSignature: http.StatusUnauthorized},
+	ProcessSync: webhook.SyncProcessorFunc(func(ctx context.Context, g security.Grant, call *webhook.Call) (webhook.ProcessResult, error) {
+		reading, duplicate, err := passages.File(ctx, g, call.Reference, call.Body())
+		if err != nil {
+			return webhook.ProcessResult{}, err // Statuses.Failed
+		}
+		if duplicate {
+			return webhook.ProcessResult{Status: http.StatusOK, Body: []byte(`{"duplicate":true}`)}, nil
+		}
+		return webhook.ProcessResult{Status: http.StatusCreated, Body: reading}, nil
+	}),
+}
+```
+
+A resolver that cannot answer now -- what it reads is down -- wraps
+`ErrReceiverUnavailable`, which answers 503. A record whose calls a different
+check admits returns its own `Validator`. A synchronous call is stored like any
+other, with the outcome on it, and `CallService.Process` processes it again on
+the queue.
+
+| refusal | `Statuses` field | default |
+| --- | --- | --- |
+| no record for the request | `Unresolved` | 404 |
+| the signature does not check | `InvalidSignature` | 403 |
+| an empty body | `EmptyBody` | accepted |
+| a body above `MaxBodyBytes` | `TooLarge` | 413 |
+| a body that cannot be read | `BadRequest` | 400 |
+| a resolver that cannot answer | `Unavailable` | 503 |
+| a `ProcessSync` error | `Failed` | 500 |
+
+The management events are the acts of people on the panel. A received call is
+not one: it is in `webhook_client_calls` already, with its outcome, so it is
+not stored again in the outbox.
 
 ## Routes
 
@@ -401,7 +474,7 @@ session store, `New` mounts none of them.
 | `GET /webhook/calls` | `webhook.calls.index` | `CallList` |
 | `GET /webhook/calls/{id}` | `webhook.calls.show` | `CallView` |
 | `POST /webhook/calls/{id}/process` | `webhook.calls.process` | `CallProcess` |
-| `POST /webhooks/{receiver}` | `webhook.receive.{receiver}` | the signature |
+| `POST /webhooks/{receiver}`, its `Path` or its `Mount` | `webhook.receive.{receiver}` | the record and the signature |
 
 ## Who may do what
 
@@ -443,6 +516,11 @@ GOWORK=off go test -race ./...
 
 The feature suite runs on SQLite with the real queue: a call received, stored,
 processed and reprocessed; a refused signature, a stale timestamp, a rotation;
+receivers resolving each call to a record by a signed token or by a key, at
+their published addresses, refusing another tenant's record, a tampered token
+and a wrong secret, answering synchronously with 201 and then 200 for a repeat;
+the shared-secret and Standard Webhooks validators, a form encoded again, the
+size limits;
 an event delivered and verified by a test server; a Standard Webhooks delivery
 checked byte for byte against a vector computed outside the module, through a
 rotation; the retry ladder, the policy's limits, the endpoint turned off after

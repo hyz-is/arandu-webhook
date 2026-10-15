@@ -6,8 +6,9 @@ endpoints the application sends to, delivered by this module's own engine, and
 receivers other systems call, whose calls are stored and processed on the
 queue. Four entities with an embedded Hesape Model (`Endpoint`, `Call`,
 `Delivery`, `DeliveryAttempt`), a policy for the first two, a service for each
-side that owns the database handle, the engine that makes the attempts, and
-the routes that reach them.
+side that owns the database handle, the engine that makes the attempts, the
+receivers -- static, or resolving each call to a record of the application --
+and the routes that reach them.
 It is a Go module somebody `go get`s and registers by hand in their own
 `bootstrap/app.go`, which is the whole difference from working in an
 application. There is no service provider, no container and no discovery — if a
@@ -68,7 +69,7 @@ this one must prove about itself it proves in its own suite or nowhere.
 | | measured with |
 | --- | --- |
 | 17 Go files, one per role and four generated, all in one package at the root | `grep -l '^package webhook' *.go` |
-| 10 test files, 71 tests | `find tests -name '*_test.go'` · `go test -count=1 ./... -v \| grep -c '^--- PASS'` |
+| 11 test files, 79 tests | `find tests -name '*_test.go'` · `go test -count=1 ./... -v \| grep -c '^--- PASS'` |
 | 17 management routes behind RequireAuth, and one route per receiver method | `grep -c 'r.Action' module.go` |
 | 17 actions the policies answer about, 12 of them offered to people | `grep -cE '^\t[A-Za-z]+ +security.Action = ' policy.go` |
 | 3 direct dependencies under `arandu-io`, one of them the SQLite connector the tests run on; hesape held at v0.56, the version framework/view compiles against | `go list -m -f '{{if and (not .Indirect) (not .Main)}}{{.Path}} {{.Version}}{{end}}' all` |
@@ -120,7 +121,7 @@ rejected in review. None of them is missing by accident.
 | a service provider, a container, a `Register()` that discovers things | `New(cfg, db, sessions)`, called by hand in the installer's `bootstrap/app.go`. Everything the package touches is a parameter |
 | a global `DB`, an `init()` that opens a connection | the `*data.DB` handed to `New`. A package that opened its own connection would be a package the application cannot point at a test database |
 | a CRUD Repository beside the Model | `Endpoints(db)`, reached only by `EndpointService` after `security.Authorize` |
-| a tenant read from the path, the body, the query or a header | `data.Tenant(g)`, from the Grant, which came from the session -- or, for a received call, from the Receiver the application configured, after the signature checked |
+| a tenant read from the path, the body, the query or a header | `data.Tenant(g)`, from the Grant, which came from the session -- or, for a received call, from the Receiver the application configured, or from the record its `Resolve` found, after the signature checked against that record's secrets. A path parameter names a record to look for, never a tenant |
 | a permit-all branch in the policy "for now" | nothing. The policy denies, and an action is opened by writing the rule that opens it |
 | an `interface{}` config, a map of options, an env var read at call time | the typed `Config` struct, validated by `New` |
 | a `panic` on bad wiring | an `error` from `New`. A wiring mistake found at boot costs one restart |

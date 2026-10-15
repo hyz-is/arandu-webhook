@@ -21,7 +21,7 @@ webhooks: a dialect or a policy it lacks is asked for in this module.
 ## Install
 
 ```bash
-go get github.com/hyz-is/arandu-webhook@v0.2.0
+go get github.com/hyz-is/arandu-webhook@v0.3.0
 ```
 
 It requires framework v0.56 and hesape v0.56. Keep hesape at v0.56:
@@ -59,7 +59,7 @@ Four more lines, each where the thing it touches is built:
 
 | where | line | without it |
 | --- | --- | --- |
-| the CSRF middleware | `middleware.CSRFExcept(webhookModule.ReceivePrefix()+"/")` | every receiver answers 419 |
+| the CSRF middleware | `middleware.CSRFExcept(webhookModule.ReceivePaths()...)` | every receiver answers 419 |
 | the events relay | `webhookModule.Publisher()` among the relay's publishers | events reach no endpoint |
 | the events relay | arandu-activitylog's `NewEventRecorder(logger)` among them | the management events are stored and never logged |
 | the worker command | `webhookModule.RegisterJobHandlers(worker)` | deliveries and received calls wait forever |
@@ -109,6 +109,19 @@ read UPGRADE.md.
 A receiver's `Tenant` is whose calls these are, from the application's
 configuration. Nothing in a request chooses it: the signature admits the call,
 and the tenant is the receiver's.
+
+A receiver that takes calls for many records of the application -- a URL per
+inbound endpoint, per integration key -- has no `Tenant` and a `Resolve`
+instead: it reads the path with `r.PathValue`, finds the record, and answers its
+tenant and secrets. Never return a tenant taken from the path. `Path` puts it
+under `ReceivePrefix` with parameters, `Mount` at an absolute address already
+published; `Validator: webhook.HeaderSecret{Header: ...}` for a provider that
+sends a shared secret as it is, `webhook.StandardWebhooks{}` for that scheme;
+`Statuses` for what each refusal answers; `ProcessSync` to process before
+answering and answer with the processor's status and body.
+
+**Symptom:** a receiver answers 404 for every call. `Resolve` found no record:
+the path, the record turned off, or a tenant that is not valid.
 
 ## Sending
 

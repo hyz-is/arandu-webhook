@@ -38,10 +38,11 @@ as `system-grant-outside-scope` when it appears in a handler, and
 not the type system, and one that never runs over an installed package. Nothing
 here reports it either. This package reaches for it in six places, each with an
 `//arandu:system-grant` comment that says why: storing a received call, whose
-signature checked against the secret the application configured and whose
-tenant is the Receiver's; queueing its processing in that same tenant; the
-scheduled clean of calls, in the tenants the Receivers name; the Publisher, in
-the tenant the outbox row was committed in; the test call, after
+signature checked against the secret the application configured -- or the
+secret of the record a receiver's `Resolve` found -- and whose tenant is the
+Receiver's or that record's, never one a path named; queueing its processing in
+that same tenant; processing it at once, for a `ProcessSync` receiver; the
+Publisher, in the tenant the outbox row was committed in; the test call, after
 `EndpointPolicy` authorized it, under `DeliveryDispatch`; and every attempt's
 job, in the tenant the delivery was recorded in, under the same action. Add a
 seventh only with the same kind of reason, written beside it.
