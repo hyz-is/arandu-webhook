@@ -312,7 +312,13 @@ func (m *Module) endpointEnable(ctx *fhttp.Context) error {
 
 func (m *Module) endpointDisable(ctx *fhttp.Context) error {
 	who, _ := ctx.User()
-	record, err := m.endpoints.Disable(ctx.Ctx(), who, ctx.Param("id"))
+	disable := m.endpoints.Disable
+	if reason := strings.TrimSpace(ctx.Input("reason")); reason != "" {
+		disable = func(c context.Context, s security.Subject, id string) (*Endpoint, error) {
+			return m.endpoints.DisableWithReason(c, s, id, reason)
+		}
+	}
+	record, err := disable(ctx.Ctx(), who, ctx.Param("id"))
 	if err != nil {
 		return err
 	}
@@ -429,43 +435,76 @@ type secretResource string
 func (s secretResource) ToArray() map[string]any { return map[string]any{"secret": string(s)} }
 func (s secretResource) With() map[string]any    { return nil }
 
-// Schedule declares the daily cleans, each run in every tenant: of old
-// received calls, as webhook-client's model:prune of WebhookCall -- every
-// tenant, because a receiver with Resolve takes calls for any of them -- and
-// of the deliveries settled longer ago than Server.Retention, with their
-// attempts. CleanSpec "-" declares none.
+// Schedule declares the daily cleans: of the received calls older than
+// DeleteAfterDays, as webhook-client's model:prune of WebhookCall, and of the
+// deliveries settled longer ago than Server.Retention, with their attempts.
+// Each is one pass over every tenant that has rows in the table, whether or
+// not the application's scheduler lists it -- the platform tenant of a
+// receiver, a tenant a resolver named -- each with a Grant for that tenant
+// alone. CleanSpec "-" declares none.
 func (m *Module) Schedule() []foundation.Task {
 	if m.cfg.CleanSpec == "-" {
 		return nil
 	}
-	retention := m.cfg.Server.Retention
-	tasks := []foundation.Task{{
+	retention, days := m.cfg.Server.Retention, m.cfg.DeleteAfterDays
+	return []foundation.Task{{
 		ID:        "webhook.deliveries.clean",
 		Spec:      m.cfg.CleanSpec,
-		Scope:     foundation.PerTenant,
+		Scope:     foundation.Global,
 		Timeout:   10 * time.Minute,
 		Singleton: true,
 		Action:    DeliveryClean,
-		Run: func(ctx context.Context, g security.Grant) error {
-			return m.sender.clean(ctx, g, m.sender.clock().Add(-retention))
+		Run: func(ctx context.Context, _ security.Grant) error {
+			return eachTenant(ctx, m.sender.db, deliveriesTable, func(tenant string) error {
+				//arandu:system-grant the tenant has deliveries in this module's table; the clean removes only its settled deliveries older than Server.Retention.
+				return m.sender.clean(ctx, security.SystemGrant(DeliveryClean, tenant), m.sender.clock().Add(-retention))
+			})
 		},
-	}}
-	if len(m.cfg.Receivers) == 0 {
-		return tasks
-	}
-	days := m.cfg.DeleteAfterDays
-	return append(tasks, foundation.Task{
+	}, {
 		ID:        "webhook.calls.clean",
 		Spec:      m.cfg.CleanSpec,
-		Scope:     foundation.PerTenant,
+		Scope:     foundation.Global,
 		Timeout:   10 * time.Minute,
 		Singleton: true,
 		Action:    CallClean,
-		Run: func(ctx context.Context, g security.Grant) error {
-			_, err := m.calls.clean(ctx, g, time.Now().UTC().AddDate(0, 0, -days))
-			return err
+		Run: func(ctx context.Context, _ security.Grant) error {
+			return eachTenant(ctx, m.client.db, callsTable, func(tenant string) error {
+				//arandu:system-grant the tenant has calls in this module's table; the clean removes only its calls older than DeleteAfterDays.
+				_, err := m.calls.clean(ctx, security.SystemGrant(CallClean, tenant), time.Now().UTC().AddDate(0, 0, -days))
+				return err
+			})
 		},
-	})
+	}}
+}
+
+// eachTenant runs fn once for every valid tenant with a row in one of this
+// module's tables. It reads the tenant column and nothing else; every row fn
+// reaches, it reaches with a Grant of that tenant.
+func eachTenant(ctx context.Context, db *data.DB, table string, fn func(tenant string) error) error {
+	rows, err := db.QueryContext(ctx, "SELECT DISTINCT tenant_id FROM "+table)
+	if err != nil {
+		return err
+	}
+	var tenants []string
+	for rows.Next() {
+		var tenant string
+		if err := rows.Scan(&tenant); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if security.ValidTenant(tenant) {
+			tenants = append(tenants, tenant)
+		}
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return err
+	}
+	for _, tenant := range tenants {
+		if err := fn(tenant); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Migrations declares the schema this module owns: the endpoints, the
@@ -473,7 +512,10 @@ func (m *Module) Schedule() []foundation.Task {
 // queue's, and the outbox the management events are stored in is hesape's
 // events, both migrated by the application.
 func (m *Module) Migrations() []foundation.Migration {
-	return []foundation.Migration{createEndpoints{}, createCalls{}, extendEndpoints{}, createDeliveries{}, createAttempts{}, addCallReference{}}
+	return []foundation.Migration{
+		createEndpoints{}, createCalls{}, extendEndpoints{}, createDeliveries{}, createAttempts{},
+		addCallReference{}, addCallRequest{},
+	}
 }
 
 var (
@@ -483,6 +525,7 @@ var (
 	_ migrations.ReversibleMigration = createDeliveries{}
 	_ migrations.ReversibleMigration = createAttempts{}
 	_ migrations.ReversibleMigration = addCallReference{}
+	_ migrations.ReversibleMigration = addCallRequest{}
 )
 
 // createEndpoints is the sending side's endpoints.
@@ -688,5 +731,29 @@ func (addCallReference) Up(ctx context.Context, conn migrations.Connection) erro
 func (addCallReference) Down(ctx context.Context, conn migrations.Connection) error {
 	return conn.Schema().Table(ctx, callsTable, func(table *schema.Blueprint) {
 		table.DropColumn("reference")
+	})
+}
+
+// addCallRequest gives a received call who connected and the digest of every
+// header it arrived with. Both columns have a default.
+type addCallRequest struct{ migrations.BaseMigration }
+
+// GetName is the migration's identity, and it carries the order.
+func (addCallRequest) GetName() string {
+	return "20261015_0007_add_remote_addr_and_headers_digest_to_webhook_client_calls"
+}
+
+// Up adds the columns.
+func (addCallRequest) Up(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().Table(ctx, callsTable, func(table *schema.Blueprint) {
+		table.String("remote_addr", 255).Default("")
+		table.String("headers_sha256", 64).Default("")
+	})
+}
+
+// Down drops the columns.
+func (addCallRequest) Down(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().Table(ctx, callsTable, func(table *schema.Blueprint) {
+		table.DropColumn("remote_addr", "headers_sha256")
 	})
 }

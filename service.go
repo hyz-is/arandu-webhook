@@ -78,6 +78,31 @@ type ImportRequest struct {
 	// CreatedAt is when the endpoint was created where it comes from. Zero
 	// means now.
 	CreatedAt time.Time
+	// ConsecutiveFailures is how many of its deliveries in a row gave up
+	// where it comes from, so DisableAfter counts on from there.
+	ConsecutiveFailures int
+	// DisabledAt and DisabledReason are when and why it was turned off where
+	// it comes from -- DisabledByFailures, or the reason a person gave. Either
+	// needs the other, and both need Active false.
+	DisabledAt     *time.Time
+	DisabledReason string
+}
+
+// MaxDisabledReason is the longest reason an endpoint is turned off with.
+const MaxDisabledReason = 64
+
+// validReason reports whether a reason for turning an endpoint off can be
+// kept: one line of printable text, at most MaxDisabledReason bytes.
+func validReason(reason string) bool {
+	if len(reason) > MaxDisabledReason || strings.TrimSpace(reason) != reason {
+		return false
+	}
+	for _, r := range reason {
+		if r < ' ' || r == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // The refusals of the endpoint use cases that are not a policy's.
@@ -149,7 +174,7 @@ func (s *EndpointService) validate(in EndpointRequest) (endpointInput, validatio
 		seen[name] = true
 		out.events = append(out.events, name)
 	}
-	if len(out.events) == 0 {
+	if len(out.events) == 0 && !s.sender.allowEmpty {
 		e.Add("events", "Choose at least one event.")
 	}
 	dialect := strings.TrimSpace(in.Dialect)
@@ -407,7 +432,7 @@ func (s *EndpointService) Enable(ctx context.Context, actor security.Subject, id
 	if record, err = s.authorized(ctx, actor, EndpointUpdate, record); err != nil {
 		return nil, err
 	}
-	return record, s.toggle(ctx, g, record, true)
+	return record, s.toggle(ctx, g, record, true, "")
 }
 
 // Disable turns an endpoint off. Its deliveries wait until it is turned on;
@@ -424,18 +449,46 @@ func (s *EndpointService) Disable(ctx context.Context, actor security.Subject, i
 	if record, err = s.authorized(ctx, actor, EndpointUpdate, record); err != nil {
 		return nil, err
 	}
-	return record, s.toggle(ctx, g, record, false)
+	return record, s.toggle(ctx, g, record, false, "")
+}
+
+// DisableWithReason turns an endpoint off as Disable does, and keeps why:
+// the reason is the endpoint's DisabledReason, with DisabledAt, and is in the
+// event that records it. It is one line of printable text of at most
+// MaxDisabledReason bytes.
+func (s *EndpointService) DisableWithReason(ctx context.Context, actor security.Subject, id, reason string) (*Endpoint, error) {
+	if !validReason(reason) || reason == "" {
+		errs := validation.Errors{}
+		errs.Add("reason", "Say why in one line of at most 64 characters.")
+		return nil, errs
+	}
+	g, err := security.Authorize(ctx, s.policy, actor, EndpointUpdate, Endpoint{})
+	if err != nil {
+		return nil, err
+	}
+	record, err := Endpoints(s.db).WhereKey(id).First(ctx, g)
+	if err != nil {
+		return nil, err
+	}
+	if record, err = s.authorized(ctx, actor, EndpointUpdate, record); err != nil {
+		return nil, err
+	}
+	return record, s.toggle(ctx, g, record, false, reason)
 }
 
 // toggle turns an authorized endpoint on or off and records it.
-func (s *EndpointService) toggle(ctx context.Context, g security.Grant, record *Endpoint, on bool) error {
+func (s *EndpointService) toggle(ctx context.Context, g security.Grant, record *Endpoint, on bool, reason string) error {
 	was := bool(record.Active)
 	event := EventEndpointDisabled
+	payload := map[string]any{"was_active": was}
 	if on {
 		record.Enable(s.sender.clock())
 		event = EventEndpointEnabled
 	} else {
-		record.Disable("", s.sender.clock())
+		record.Disable(reason, s.sender.clock())
+		if reason != "" {
+			payload["reason"] = reason
+		}
 	}
 	return data.Transaction(ctx, s.db, func(ctx context.Context) error {
 		if _, err := record.Save(ctx, g); err != nil {
@@ -446,7 +499,7 @@ func (s *EndpointService) toggle(ctx context.Context, g security.Grant, record *
 				return err
 			}
 		}
-		return s.audit.record(ctx, g, event, aggregateEndpoint, record.ID, map[string]any{"was_active": was})
+		return s.audit.record(ctx, g, event, aggregateEndpoint, record.ID, payload)
 	})
 }
 
@@ -544,6 +597,17 @@ func (s *EndpointService) Import(ctx context.Context, actor security.Subject, in
 	if len(in.PreviousSecrets) > MaxPreviousSecrets {
 		errs.Add("previous_secrets", "Keep at most 5 previous secrets.")
 	}
+	if in.ConsecutiveFailures < 0 {
+		errs.Add("consecutive_failures", "A count of failures cannot be negative.")
+	}
+	switch {
+	case !validReason(in.DisabledReason):
+		errs.Add("disabled_reason", "Say why in one line of at most 64 characters.")
+	case (in.DisabledAt == nil) != (in.DisabledReason == ""):
+		errs.Add("disabled_reason", "Give when and why it was turned off together, or neither.")
+	case in.DisabledAt != nil && in.Active:
+		errs.Add("disabled_reason", "An endpoint turned off is not active.")
+	}
 	if errs.Any() {
 		return nil, errs
 	}
@@ -575,14 +639,29 @@ func (s *EndpointService) Import(ctx context.Context, actor security.Subject, in
 		return nil, err
 	}
 	record.CreatedAt = now
+	record.ConsecutiveFailures = in.ConsecutiveFailures
+	if in.DisabledAt != nil {
+		at := in.DisabledAt.UTC()
+		record.DisabledAt, record.DisabledReason = &at, in.DisabledReason
+	}
+	created := now
 	if !in.CreatedAt.IsZero() {
-		record.CreatedAt = in.CreatedAt.UTC()
+		created = in.CreatedAt.UTC()
 	}
 	err = data.Transaction(ctx, s.db, func(ctx context.Context) error {
 		if _, err := record.Save(ctx, g); err != nil {
 			return err
 		}
-		return s.audit.record(ctx, g, EventEndpointImported, aggregateEndpoint, record.ID, endpointFacts(record))
+		// The Model stamps created_at with the moment of the insert; the
+		// moment the endpoint was created where it comes from is written
+		// over it.
+		if _, err := Endpoints(s.db).WhereKey(record.ID).Update(ctx, g, map[string]any{"created_at": created}); err != nil {
+			return err
+		}
+		record.CreatedAt = created
+		facts := endpointFacts(record)
+		facts["created_at"] = created.Format(time.RFC3339)
+		return s.audit.record(ctx, g, EventEndpointImported, aggregateEndpoint, record.ID, facts)
 	})
 	if err != nil {
 		return nil, err

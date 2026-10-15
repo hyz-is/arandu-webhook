@@ -158,16 +158,20 @@ func TestTheServicesRefuseBeforeReachingTheModel(t *testing.T) {
 	ctx, who := context.Background(), administrator()
 
 	for name, call := range map[string]func() error{
-		"Endpoint.List":      func() error { _, err := endpoints.List(ctx, who, data.Query{}); return err },
-		"Endpoint.Find":      func() error { _, err := endpoints.Find(ctx, who, "e-1"); return err },
-		"Endpoint.Update":    func() error { _, err := endpoints.Update(ctx, who, "e-1", validRequest()); return err },
-		"Endpoint.Delete":    func() error { return endpoints.Delete(ctx, who, "e-1") },
-		"Endpoint.Secret":    func() error { _, err := endpoints.Secret(ctx, who, "e-1"); return err },
-		"Endpoint.Headers":   func() error { _, err := endpoints.HeaderNames(ctx, who, "e-1"); return err },
-		"Endpoint.Test":      func() error { _, err := endpoints.Test(ctx, who, "e-1"); return err },
-		"Endpoint.Rotate":    func() error { _, err := endpoints.Rotate(ctx, who, "e-1", time.Hour); return err },
-		"Endpoint.Enable":    func() error { _, err := endpoints.Enable(ctx, who, "e-1"); return err },
-		"Endpoint.Disable":   func() error { _, err := endpoints.Disable(ctx, who, "e-1"); return err },
+		"Endpoint.List":    func() error { _, err := endpoints.List(ctx, who, data.Query{}); return err },
+		"Endpoint.Find":    func() error { _, err := endpoints.Find(ctx, who, "e-1"); return err },
+		"Endpoint.Update":  func() error { _, err := endpoints.Update(ctx, who, "e-1", validRequest()); return err },
+		"Endpoint.Delete":  func() error { return endpoints.Delete(ctx, who, "e-1") },
+		"Endpoint.Secret":  func() error { _, err := endpoints.Secret(ctx, who, "e-1"); return err },
+		"Endpoint.Headers": func() error { _, err := endpoints.HeaderNames(ctx, who, "e-1"); return err },
+		"Endpoint.Test":    func() error { _, err := endpoints.Test(ctx, who, "e-1"); return err },
+		"Endpoint.Rotate":  func() error { _, err := endpoints.Rotate(ctx, who, "e-1", time.Hour); return err },
+		"Endpoint.Enable":  func() error { _, err := endpoints.Enable(ctx, who, "e-1"); return err },
+		"Endpoint.Disable": func() error { _, err := endpoints.Disable(ctx, who, "e-1"); return err },
+		"Endpoint.DisableWithReason": func() error {
+			_, err := endpoints.DisableWithReason(ctx, who, "e-1", "maintenance")
+			return err
+		},
 		"Endpoint.Delivery":  func() error { _, err := endpoints.Delivery(ctx, who, "d-1"); return err },
 		"Endpoint.Attempts":  func() error { _, err := endpoints.Attempts(ctx, who, "d-1"); return err },
 		"Endpoint.Redeliver": func() error { _, err := endpoints.Redeliver(ctx, who, "d-1"); return err },

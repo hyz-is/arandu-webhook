@@ -172,6 +172,7 @@ type processMessage struct {
 type receiver struct {
 	Receiver
 	secrets hwebhook.SecretSet
+	pattern string
 }
 
 // client is the receiving side.
@@ -194,7 +195,7 @@ func newClient(db *data.DB, cfg Config, audit *auditor) *client {
 		for _, previous := range r.PreviousSecrets {
 			set.Previous = append(set.Previous, []byte(previous))
 		}
-		c.receivers[r.Name] = &receiver{Receiver: r, secrets: set}
+		c.receivers[r.Name] = &receiver{Receiver: r, secrets: set, pattern: r.route(cfg.ReceivePrefix)}
 	}
 	return c
 }
@@ -371,7 +372,9 @@ func (c *client) store(ctx context.Context, r *http.Request, rc *receiver, to ad
 	}
 	now := c.now()
 	call.TenantID, call.Name, call.Method, call.Reference = data.Tenant(g), rc.Name, r.Method, to.reference
-	call.URL, call.HeaderData, call.Payload = requestURL(r), keptHeaders(r.Header, rc.StoreHeaders), string(body)
+	call.URL, call.HeaderData, call.Payload = keptURL(r, rc), keptHeaders(r.Header, rc.StoreHeaders), string(body)
+	received := r.Header.Clone()
+	call.RemoteAddr, call.HeadersSHA256, call.received = clip(r.RemoteAddr, 255), HeadersDigest(r.Header), &received
 	call.Status, call.ProcessedAt, call.CreatedAt, call.UpdatedAt = CallReceived, now, now, now
 	err = data.Transaction(ctx, c.db, func(ctx context.Context) error {
 		if _, err := call.Save(ctx, g); err != nil {
@@ -455,15 +458,25 @@ func (c *client) handle(ctx context.Context, g security.Grant, j *jobs.Job) erro
 	return failure
 }
 
-// requestURL is the address the call arrived at.
-func requestURL(r *http.Request) string {
+// keptURL is the address the call arrived at, as the receiver keeps it.
+func keptURL(r *http.Request, rc *receiver) string {
 	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"
 	}
-	u := scheme + "://" + r.Host + r.URL.RequestURI()
-	if len(u) > hwebhook.MaxURLLength {
-		u = u[:hwebhook.MaxURLLength]
+	switch rc.URL {
+	case URLNone:
+		return ""
+	case URLRoute:
+		return clip(scheme+"://"+r.Host+rc.pattern, hwebhook.MaxURLLength)
 	}
-	return u
+	return clip(scheme+"://"+r.Host+r.URL.RequestURI(), hwebhook.MaxURLLength)
+}
+
+// clip cuts a text to a column's width.
+func clip(text string, width int) string {
+	if len(text) > width {
+		return text[:width]
+	}
+	return text
 }

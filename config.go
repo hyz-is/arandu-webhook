@@ -151,6 +151,12 @@ type Server struct {
 	// event name.
 	Events []string
 
+	// AllowEmptySubscription lets an endpoint subscribe to no event: the
+	// events outbox then sends it nothing, while Send, the test call and a
+	// redelivery still reach it. False refuses an endpoint with no event, as
+	// before.
+	AllowEmptySubscription bool
+
 	// Secrets are named signing secrets for calls built with Outgoing, as
 	// webhook-server's useSecret. Each is at least MinSecretBytes long.
 	Secrets map[string]string
@@ -237,6 +243,12 @@ type Receiver struct {
 	// Statuses are what each refusal answers. A zero field keeps its
 	// default.
 	Statuses Statuses
+
+	// URL is how the address a call arrived at is kept on it. Empty keeps
+	// the full address of a receiver whose route has no parameter, and only
+	// the route -- its parameters as {name}, no query -- of one whose route
+	// has, because a path parameter is often a bearer token.
+	URL URLMode
 
 	// Tries is how many times a call is processed before it stays failed.
 	// Zero means DefaultTries.
@@ -356,6 +368,20 @@ func (r Receiver) route(receivePrefix string) string {
 	return receivePrefix + "/" + r.Name
 }
 
+// URLMode is how a received call keeps the address it arrived at.
+type URLMode string
+
+const (
+	// URLFull keeps the scheme, host, path and query as they arrived.
+	URLFull URLMode = "full"
+	// URLRoute keeps the scheme, host and the receiver's route, its path
+	// parameters written as {name} and no query: what was called, without
+	// the values a path or a query carried.
+	URLRoute URLMode = "route"
+	// URLNone keeps no address.
+	URLNone URLMode = "none"
+)
+
 // Statuses are what a receiver answers each refusal with. A zero field keeps
 // its default, which is what a receiver answered before it could be chosen.
 type Statuses struct {
@@ -421,6 +447,11 @@ func (r Receiver) validate() error {
 	if r.Mount != "" && (!strings.HasPrefix(r.Mount, "/") || strings.HasSuffix(r.Mount, "/") ||
 		r.Mount == reservedPrefix || strings.HasPrefix(r.Mount, reservedPrefix+"/")) {
 		return fmt.Errorf("receiver %q: Mount %q is an absolute path, not ending in / and not under %s", r.Name, r.Mount, reservedPrefix)
+	}
+	switch r.URL {
+	case "", URLFull, URLRoute, URLNone:
+	default:
+		return fmt.Errorf("receiver %q: URL %q is not URLFull, URLRoute or URLNone", r.Name, r.URL)
 	}
 	for _, status := range []int{r.Statuses.Unresolved, r.Statuses.InvalidSignature, r.Statuses.EmptyBody,
 		r.Statuses.TooLarge, r.Statuses.Unavailable, r.Statuses.Failed, r.Statuses.BadRequest} {
@@ -526,6 +557,12 @@ func (c Config) withDefaults() Config {
 			r.Respond = RespondOK{}
 		}
 		r.Statuses = r.Statuses.withDefaults()
+		if r.URL == "" {
+			r.URL = URLFull
+			if strings.Contains(r.route(c.ReceivePrefix), "{") {
+				r.URL = URLRoute
+			}
+		}
 		if r.Tries == 0 {
 			r.Tries = DefaultTries
 		}

@@ -1,6 +1,8 @@
 package webhook
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -85,9 +87,18 @@ type Call struct {
 	// Reference is what the receiver's Resolve said the call is for -- the
 	// record the processor finds again -- and empty for a static receiver.
 	Reference string `db:"reference"`
-	// Method and URL are how it arrived.
+	// Method and URL are how it arrived. URL is kept as the receiver's URL
+	// mode says: whole, or only its route, so a bearer token in the path
+	// is not kept.
 	Method string `db:"method"`
 	URL    string `db:"url"`
+	// RemoteAddr is who connected, as the request reported it: the peer,
+	// or what a proxy in front of the application wrote there.
+	RemoteAddr string `db:"remote_addr"`
+	// HeadersSHA256 is HeadersDigest of every header the call arrived with,
+	// kept whatever StoreHeaders keeps: two senders told apart without
+	// keeping what an unauthenticated sender put in a header.
+	HeadersSHA256 string `db:"headers_sha256"`
 	// HeaderData is the JSON object of the headers the receiver keeps, by
 	// lowercase name.
 	HeaderData string `db:"headers"`
@@ -106,6 +117,10 @@ type Call struct {
 
 	CreatedAt time.Time `db:"created_at"`
 	UpdatedAt time.Time `db:"updated_at"`
+
+	// received is every header of the request, while the request is being
+	// answered. It is not a column, and a pointer so Call stays comparable.
+	received *http.Header
 }
 
 // CallStatus is where a received call stands.
@@ -432,6 +447,38 @@ func (c Call) Headers() map[string][]string {
 	return out
 }
 
+// ReceivedHeaders returns every header the call arrived with, kept or not,
+// to a processor that runs while the request is answered -- a SyncProcessor.
+// It is nil once the call was read back from its table: a processor on the
+// queue reads Headers, which StoreHeaders chose, and HeadersSHA256.
+func (c Call) ReceivedHeaders() http.Header {
+	if c.received == nil {
+		return nil
+	}
+	return c.received.Clone()
+}
+
+// HeadersDigest is the hex SHA-256 of a request's headers in one canonical
+// form: every name lowercased, the names sorted, and for each a line of the
+// name, ": ", its values joined by ", " in the order they arrived, and "\n".
+func HeadersDigest(h http.Header) string {
+	lines := map[string][]string{}
+	for name, values := range h {
+		lower := strings.ToLower(strings.TrimSpace(name))
+		lines[lower] = append(lines[lower], values...)
+	}
+	names := make([]string, 0, len(lines))
+	for name := range lines {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	sum := sha256.New()
+	for _, name := range names {
+		_, _ = sum.Write([]byte(name + ": " + strings.Join(lines[name], ", ") + "\n"))
+	}
+	return hex.EncodeToString(sum.Sum(nil))
+}
+
 // Body returns the body as it arrived.
 func (c Call) Body() []byte { return []byte(c.Payload) }
 
@@ -557,6 +604,7 @@ func (r CallResource) ToArray() map[string]any {
 	out := map[string]any{
 		"id": r.c.ID, "name": r.c.Name, "reference": r.c.Reference, "method": r.c.Method, "url": r.c.URL,
 		"headers": r.c.Headers(), "payload": r.c.Payload, "status": string(r.c.Status),
+		"remote_addr": r.c.RemoteAddr, "headers_sha256": r.c.HeadersSHA256,
 		"attempts": r.c.Attempts, "exception": r.c.Exception,
 		"created_at": r.c.CreatedAt.UTC().Format(time.RFC3339),
 	}

@@ -274,11 +274,12 @@ func TestTheCleanRemovesOldCalls(t *testing.T) {
 			clean = &w.module.Schedule()[i]
 		}
 	}
-	if clean == nil || clean.Scope != foundation.PerTenant {
+	if clean == nil || clean.Scope != foundation.Global {
 		t.Fatalf("the module schedules %v", w.module.Schedule())
 	}
-	// The scheduler runs a per-tenant task with each tenant's Grant.
-	if err := clean.Run(context.Background(), security.SystemGrant(webhook.CallClean, tenant)); err != nil {
+	// A global task gets the zero Grant: the clean issues one per tenant
+	// that has calls.
+	if err := clean.Run(context.Background(), security.Grant{}); err != nil {
 		t.Fatal(err)
 	}
 	left := w.calls(t, tenant)

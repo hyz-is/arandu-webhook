@@ -10,6 +10,51 @@ a release is corrected by another release and never by moving a tag.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-15
+
+What the first application to move its webhooks into the module found
+missing.
+
+### Added
+
+- `ImportRequest.ConsecutiveFailures`, `DisabledAt` and `DisabledReason`, so an
+  imported endpoint keeps its count towards `DisableAfter` and why it was
+  turned off. `DisabledAt` and `DisabledReason` come together and need
+  `Active` false; a reason is one line of at most `MaxDisabledReason` (64)
+  bytes.
+- `EndpointService.DisableWithReason`: turns an endpoint off keeping the
+  reason in `DisabledReason`, with `DisabledAt`, and in the
+  `webhook.endpoint.disabled` event. `POST …/endpoints/{id}/disable` takes it
+  as `reason`.
+- `Server.AllowEmptySubscription`: an endpoint may subscribe to no event. The
+  events outbox sends it nothing; `Send`, the test call and a redelivery
+  still reach it. Without it an endpoint with no event is refused, as before.
+- `Call.RemoteAddr` and `Call.HeadersSHA256`, kept on every received call;
+  `HeadersDigest`, the canonical SHA-256 of a request's headers; and
+  `Call.ReceivedHeaders`, every header of the request, for a `SyncProcessor`
+  -- including the ones `StoreHeaders` does not keep.
+- `Receiver.URL` (`URLMode`: `URLFull`, `URLRoute`, `URLNone`): how a call
+  keeps the address it arrived at.
+- The migration
+  `20261015_0007_add_remote_addr_and_headers_digest_to_webhook_client_calls`.
+
+### Changed
+
+- A receiver whose `Path` or `Mount` has a path parameter keeps only its route
+  on the call -- `https://host/webhooks/cielo/{token}`, no query -- because the
+  parameter is often a bearer token. `URL: webhook.URLFull` keeps the whole
+  address. Calls stored before stay as they are.
+- `webhook.calls.clean` and `webhook.deliveries.clean` are one global pass
+  over every tenant with rows in their table, each tenant under a Grant of its
+  own, instead of a task per tenant the scheduler lists: a platform tenant, or
+  a tenant a resolver named, is cleaned too.
+
+### Fixed
+
+- `ImportRequest.CreatedAt` is kept: the insert no longer stamps the moment of
+  the import over it.
+
+
 ## [0.3.0] - 2026-10-15
 
 The receiving side takes calls addressed to records of the application, at

@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+## v0.4.0
+
+No signature changes. Run `aru migrate` for
+`20261015_0007_add_remote_addr_and_headers_digest_to_webhook_client_calls`,
+which adds two columns with defaults to `webhook_client_calls`.
+
+A receiver with a path parameter now keeps only its route in
+`webhook_client_calls.url`. The calls stored by v0.3.0 keep the full address,
+token included; an application whose path parameter is a bearer token clears
+them once, for example:
+
+```sql
+UPDATE webhook_client_calls SET url = '' WHERE name = 'cielo';
+```
+
+The cleans are global tasks again, one pass each over every tenant with rows;
+nothing in the scheduler's configuration needs to list a tenant for its calls
+or deliveries to be cleaned.
+
+To keep the reason a person gives for turning an endpoint off, call
+`DisableWithReason` instead of `Disable`, or send `reason` to the disable
+route.
+
+
 ## v0.3.0
 
 Nothing to rewrite: every field added is optional, and a receiver configured

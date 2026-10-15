@@ -70,19 +70,20 @@ var idPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]*$`)
 // sender is the sending side: the deliveries this module records, the jobs
 // that make their attempts, and the endpoints they go to.
 type sender struct {
-	db        *data.DB
-	queue     *queue.DatabaseQueue
-	queueName string
-	sealer    *sealer
-	audit     *auditor
-	named     map[string]string
-	allowed   map[string]bool
-	custom    string
-	prefix    string
-	policy    Policy
-	client    *http.Client
-	now       func() time.Time
-	retention time.Duration
+	db         *data.DB
+	queue      *queue.DatabaseQueue
+	queueName  string
+	sealer     *sealer
+	audit      *auditor
+	named      map[string]string
+	allowed    map[string]bool
+	allowEmpty bool
+	custom     string
+	prefix     string
+	policy     Policy
+	client     *http.Client
+	now        func() time.Time
+	retention  time.Duration
 }
 
 func newSender(db *data.DB, cfg Config, seal *sealer, audit *auditor) (*sender, error) {
@@ -94,6 +95,7 @@ func newSender(db *data.DB, cfg Config, seal *sealer, audit *auditor) (*sender, 
 		db: db, queue: queue.NewDatabaseQueue(db), queueName: cfg.Server.Queue, sealer: seal, audit: audit,
 		named: map[string]string{}, custom: cfg.Server.HeaderPrefix, prefix: "X-Arandu",
 		policy: cfg.Server.Policy.clone(), client: client, now: cfg.Server.Now, retention: cfg.Server.Retention,
+		allowEmpty: cfg.Server.AllowEmptySubscription,
 	}
 	if s.custom != "" {
 		s.prefix = s.custom
