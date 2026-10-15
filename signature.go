@@ -3,6 +3,8 @@ package webhook
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -204,4 +206,98 @@ func (s *sealer) openPrevious(tenant, id, sealed string) ([]PreviousSecret, erro
 		return nil, err
 	}
 	return out, nil
+}
+
+// headerValidator is a validator that reads only the request's headers, so
+// the receiver asks it before reading the body: a call it refuses is refused
+// whatever its body is.
+type headerValidator interface {
+	readsHeadersOnly() bool
+}
+
+// HeaderSecret checks a shared secret sent as it is in a header, as a
+// provider that signs nothing sends it: the header has to equal the current
+// secret or one still accepted during a rotation, compared in constant time.
+// A receiver with no secret refuses every call. The body is not read before
+// the check.
+type HeaderSecret struct {
+	// Header carries the secret.
+	Header string
+}
+
+// Valid compares the header with every accepted secret.
+func (v HeaderSecret) Valid(r *http.Request, _ []byte, secrets hwebhook.SecretSet) bool {
+	given := r.Header.Get(v.Header)
+	if v.Header == "" || given == "" {
+		return false
+	}
+	matched := 0
+	for _, secret := range allSecrets(secrets) {
+		matched |= subtle.ConstantTimeCompare([]byte(given), secret)
+	}
+	return matched == 1
+}
+
+func (HeaderSecret) readsHeadersOnly() bool { return true }
+
+// StandardWebhooks checks the Standard Webhooks scheme: webhook-signature
+// carries "v1," and the standard base64 HMAC-SHA256 of id.timestamp.body
+// under the key a whsec_ secret encodes, once per secret the sender signs
+// with; one matching any accepted secret is enough. A timestamp further than
+// Tolerance from now is refused, so a captured call cannot be sent again
+// later.
+type StandardWebhooks struct {
+	// Tolerance is the accepted clock difference. Zero means
+	// DefaultTolerance.
+	Tolerance time.Duration
+	// Now is the clock, replaceable by a test. Nil is time.Now.
+	Now func() time.Time
+}
+
+// Valid checks the timestamp's age, then every signature against every
+// accepted secret.
+func (v StandardWebhooks) Valid(r *http.Request, body []byte, secrets hwebhook.SecretSet) bool {
+	tolerance := v.Tolerance
+	if tolerance == 0 {
+		tolerance = DefaultTolerance
+	}
+	now := time.Now()
+	if v.Now != nil {
+		now = v.Now()
+	}
+	id, timestamp := r.Header.Get(StandardHeaderID), r.Header.Get(StandardHeaderTimestamp)
+	seconds, err := strconv.ParseInt(timestamp, 10, 64)
+	if id == "" || err != nil {
+		return false
+	}
+	if age := now.Sub(time.Unix(seconds, 0)); age > tolerance || age < -tolerance {
+		return false
+	}
+	var given [][]byte
+	for _, entry := range strings.Fields(r.Header.Get(StandardHeaderSignature)) {
+		version, encoded, ok := strings.Cut(entry, ",")
+		if !ok || version != "v1" {
+			continue
+		}
+		if signature, err := base64.StdEncoding.DecodeString(encoded); err == nil {
+			given = append(given, signature)
+		}
+	}
+	matched := false
+	for _, secret := range allSecrets(secrets) {
+		key, err := standardKey(string(secret))
+		if err != nil {
+			continue
+		}
+		mac := hmac.New(sha256.New, key)
+		_, _ = mac.Write([]byte(id + "." + timestamp + "."))
+		_, _ = mac.Write(body)
+		expected := mac.Sum(nil)
+		for _, signature := range given {
+			if hmac.Equal(signature, expected) {
+				matched = true
+			}
+		}
+	}
+	return matched
 }

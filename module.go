@@ -138,6 +138,30 @@ func (m *Module) Outgoing() *Outgoing { return &Outgoing{s: m.sender} }
 // application's CSRF exemption.
 func (m *Module) ReceivePrefix() string { return m.cfg.ReceivePrefix }
 
+// ReceivePaths are the path prefixes the receivers answer under, for the
+// application's CSRF exemption: ReceivePrefix, and the fixed part of every
+// Mount, up to its first parameter.
+//
+//	middleware.CSRFExcept(webhookModule.ReceivePaths()...)
+func (m *Module) ReceivePaths() []string {
+	out := []string{m.cfg.ReceivePrefix + "/"}
+	seen := map[string]bool{out[0]: true}
+	for _, rc := range m.cfg.Receivers {
+		if rc.Mount == "" {
+			continue
+		}
+		fixed := rc.Mount
+		if i := strings.Index(fixed, "{"); i >= 0 {
+			fixed = fixed[:strings.LastIndex(fixed[:i], "/")+1]
+		}
+		if !seen[fixed] {
+			seen[fixed] = true
+			out = append(out, fixed)
+		}
+	}
+	return out
+}
+
 // RegisterJobHandlers gives the worker the attempts of the deliveries and
 // the processing of received calls. The worker is the application's,
 // started by its worker command, on Server.Queue.
@@ -165,7 +189,7 @@ func (m *Module) Routes(r *fhttp.Router) {
 			if i > 0 {
 				name += "." + strings.ToLower(method)
 			}
-			r.Action(method, m.cfg.ReceivePrefix+"/"+rc.Name, handler).Name(name)
+			r.Action(method, rc.route(m.cfg.ReceivePrefix), handler).Name(name)
 		}
 	}
 	if m.sessions == nil {
@@ -405,10 +429,11 @@ type secretResource string
 func (s secretResource) ToArray() map[string]any { return map[string]any{"secret": string(s)} }
 func (s secretResource) With() map[string]any    { return nil }
 
-// Schedule declares the daily cleans: of old received calls, as
-// webhook-client's model:prune of WebhookCall, in each receiver's tenant; and
+// Schedule declares the daily cleans, each run in every tenant: of old
+// received calls, as webhook-client's model:prune of WebhookCall -- every
+// tenant, because a receiver with Resolve takes calls for any of them -- and
 // of the deliveries settled longer ago than Server.Retention, with their
-// attempts, in every tenant. CleanSpec "-" declares none.
+// attempts. CleanSpec "-" declares none.
 func (m *Module) Schedule() []foundation.Task {
 	if m.cfg.CleanSpec == "-" {
 		return nil
@@ -428,32 +453,17 @@ func (m *Module) Schedule() []foundation.Task {
 	if len(m.cfg.Receivers) == 0 {
 		return tasks
 	}
-	seen := map[string]bool{}
-	var tenants []string
-	for _, rc := range m.cfg.Receivers {
-		if !seen[rc.Tenant] {
-			seen[rc.Tenant] = true
-			tenants = append(tenants, rc.Tenant)
-		}
-	}
 	days := m.cfg.DeleteAfterDays
 	return append(tasks, foundation.Task{
 		ID:        "webhook.calls.clean",
 		Spec:      m.cfg.CleanSpec,
-		Scope:     foundation.Global,
+		Scope:     foundation.PerTenant,
 		Timeout:   10 * time.Minute,
 		Singleton: true,
 		Action:    CallClean,
-		Run: func(ctx context.Context, _ security.Grant) error {
-			cutoff := time.Now().UTC().AddDate(0, 0, -days)
-			for _, tenant := range tenants {
-				//arandu:system-grant the application named this tenant in a Receiver; the clean removes only its calls older than DeleteAfterDays.
-				g := security.SystemGrant(CallClean, tenant)
-				if _, err := m.calls.clean(ctx, g, cutoff); err != nil {
-					return err
-				}
-			}
-			return nil
+		Run: func(ctx context.Context, g security.Grant) error {
+			_, err := m.calls.clean(ctx, g, time.Now().UTC().AddDate(0, 0, -days))
+			return err
 		},
 	})
 }
@@ -463,7 +473,7 @@ func (m *Module) Schedule() []foundation.Task {
 // queue's, and the outbox the management events are stored in is hesape's
 // events, both migrated by the application.
 func (m *Module) Migrations() []foundation.Migration {
-	return []foundation.Migration{createEndpoints{}, createCalls{}, extendEndpoints{}, createDeliveries{}, createAttempts{}}
+	return []foundation.Migration{createEndpoints{}, createCalls{}, extendEndpoints{}, createDeliveries{}, createAttempts{}, addCallReference{}}
 }
 
 var (
@@ -472,6 +482,7 @@ var (
 	_ migrations.ReversibleMigration = extendEndpoints{}
 	_ migrations.ReversibleMigration = createDeliveries{}
 	_ migrations.ReversibleMigration = createAttempts{}
+	_ migrations.ReversibleMigration = addCallReference{}
 )
 
 // createEndpoints is the sending side's endpoints.
@@ -654,4 +665,28 @@ func (createAttempts) Up(ctx context.Context, conn migrations.Connection) error 
 // Down drops the table.
 func (createAttempts) Down(ctx context.Context, conn migrations.Connection) error {
 	return conn.Schema().DropIfExists(ctx, attemptsTable)
+}
+
+// addCallReference gives a received call the record its receiver resolved it
+// to. The column has a default, so the calls already stored, and a row a
+// binary of the previous release writes during a rollout, read back.
+type addCallReference struct{ migrations.BaseMigration }
+
+// GetName is the migration's identity, and it carries the order.
+func (addCallReference) GetName() string {
+	return "20261015_0006_add_reference_to_webhook_client_calls"
+}
+
+// Up adds the column.
+func (addCallReference) Up(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().Table(ctx, callsTable, func(table *schema.Blueprint) {
+		table.String("reference", 255).Default("")
+	})
+}
+
+// Down drops the column.
+func (addCallReference) Down(ctx context.Context, conn migrations.Connection) error {
+	return conn.Schema().Table(ctx, callsTable, func(table *schema.Blueprint) {
+		table.DropColumn("reference")
+	})
 }

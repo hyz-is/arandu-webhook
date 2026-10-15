@@ -3,6 +3,7 @@ package unit_test
 import (
 	"context"
 	"errors"
+	"net/http"
 	"slices"
 	"strings"
 	"testing"
@@ -341,6 +342,7 @@ func TestTheConfigurationRefusesWhatCannotWork(t *testing.T) {
 
 	key := []byte(testKey)
 	process := webhook.ProcessorFunc(func(context.Context, security.Grant, *webhook.Call) error { return nil })
+	resolver := webhook.ResolverFunc(func(*http.Request) (webhook.Resolution, error) { return webhook.Resolution{}, nil })
 	receiver := func(r webhook.Receiver) webhook.Config {
 		if r.Process == nil {
 			r.Process = process
@@ -348,27 +350,42 @@ func TestTheConfigurationRefusesWhatCannotWork(t *testing.T) {
 		return webhook.Config{Key: key, Receivers: []webhook.Receiver{r}}
 	}
 	for name, cfg := range map[string]webhook.Config{
-		"no key":                     {},
-		"short key":                  {Key: []byte("short")},
-		"relative prefix":            {Key: key, Prefix: "webhook"},
-		"prefix ending in a slash":   {Key: key, ReceivePrefix: "/webhooks/"},
-		"page size too big":          {Key: key, PageSize: webhook.MaxPageSize + 1},
-		"short named secret":         {Key: key, Server: webhook.Server{Secrets: map[string]string{"partners": "short"}}},
-		"bad named secret":           {Key: key, Server: webhook.Server{Secrets: map[string]string{"Partners!": testKey}}},
-		"bad header prefix":          {Key: key, Server: webhook.Server{HeaderPrefix: "X Acme"}},
-		"policy without tries":       {Key: key, Server: webhook.Server{Policy: &webhook.Policy{Timeout: time.Second, MaxRequestBytes: 1}}},
-		"policy beside a timeout":    {Key: key, Server: webhook.Server{Policy: policyWith(func(p *webhook.Policy) {}), Timeout: time.Second}},
-		"policy with no wait":        {Key: key, Server: webhook.Server{Policy: policyWith(func(p *webhook.Policy) { p.Backoff = nil })}},
-		"policy with a long wait":    {Key: key, Server: webhook.Server{Policy: policyWith(func(p *webhook.Policy) { p.Backoff = []time.Duration{webhook.MaxBackoff + 1} })}},
-		"policy with no timeout":     {Key: key, Server: webhook.Server{Policy: policyWith(func(p *webhook.Policy) { p.Timeout = 0 })}},
-		"policy with a huge body":    {Key: key, Server: webhook.Server{Policy: policyWith(func(p *webhook.Policy) { p.MaxRequestBytes = webhook.MaxRequestBytes + 1 })}},
-		"policy with a bad retry":    {Key: key, Server: webhook.Server{Policy: policyWith(func(p *webhook.Policy) { p.Retry = "sometimes" })}},
-		"policy with a bad agent":    {Key: key, Server: webhook.Server{Policy: policyWith(func(p *webhook.Policy) { p.UserAgent = "a\nb" })}},
-		"receiver without a name":    receiver(webhook.Receiver{Tenant: "acme", Secret: testKey}),
-		"receiver without a tenant":  receiver(webhook.Receiver{Name: "billing", Secret: testKey}),
-		"receiver without a secret":  receiver(webhook.Receiver{Name: "billing", Tenant: "acme"}),
-		"receiver with a bad method": receiver(webhook.Receiver{Name: "billing", Tenant: "acme", Secret: testKey, Methods: []string{"TRACE"}}),
-		"receiver without a process": {Key: key, Receivers: []webhook.Receiver{{Name: "billing", Tenant: "acme", Secret: testKey}}},
+		"no key":                                  {},
+		"short key":                               {Key: []byte("short")},
+		"relative prefix":                         {Key: key, Prefix: "webhook"},
+		"prefix ending in a slash":                {Key: key, ReceivePrefix: "/webhooks/"},
+		"page size too big":                       {Key: key, PageSize: webhook.MaxPageSize + 1},
+		"short named secret":                      {Key: key, Server: webhook.Server{Secrets: map[string]string{"partners": "short"}}},
+		"bad named secret":                        {Key: key, Server: webhook.Server{Secrets: map[string]string{"Partners!": testKey}}},
+		"bad header prefix":                       {Key: key, Server: webhook.Server{HeaderPrefix: "X Acme"}},
+		"policy without tries":                    {Key: key, Server: webhook.Server{Policy: &webhook.Policy{Timeout: time.Second, MaxRequestBytes: 1}}},
+		"policy beside a timeout":                 {Key: key, Server: webhook.Server{Policy: policyWith(func(p *webhook.Policy) {}), Timeout: time.Second}},
+		"policy with no wait":                     {Key: key, Server: webhook.Server{Policy: policyWith(func(p *webhook.Policy) { p.Backoff = nil })}},
+		"policy with a long wait":                 {Key: key, Server: webhook.Server{Policy: policyWith(func(p *webhook.Policy) { p.Backoff = []time.Duration{webhook.MaxBackoff + 1} })}},
+		"policy with no timeout":                  {Key: key, Server: webhook.Server{Policy: policyWith(func(p *webhook.Policy) { p.Timeout = 0 })}},
+		"policy with a huge body":                 {Key: key, Server: webhook.Server{Policy: policyWith(func(p *webhook.Policy) { p.MaxRequestBytes = webhook.MaxRequestBytes + 1 })}},
+		"policy with a bad retry":                 {Key: key, Server: webhook.Server{Policy: policyWith(func(p *webhook.Policy) { p.Retry = "sometimes" })}},
+		"policy with a bad agent":                 {Key: key, Server: webhook.Server{Policy: policyWith(func(p *webhook.Policy) { p.UserAgent = "a\nb" })}},
+		"receiver without a name":                 receiver(webhook.Receiver{Tenant: "acme", Secret: testKey}),
+		"receiver without a tenant":               receiver(webhook.Receiver{Name: "billing", Secret: testKey}),
+		"receiver without a secret":               receiver(webhook.Receiver{Name: "billing", Tenant: "acme"}),
+		"receiver with a bad method":              receiver(webhook.Receiver{Name: "billing", Tenant: "acme", Secret: testKey, Methods: []string{"TRACE"}}),
+		"receiver without a process":              {Key: key, Receivers: []webhook.Receiver{{Name: "billing", Tenant: "acme", Secret: testKey}}},
+		"a receiver with a tenant and a resolver": receiver(webhook.Receiver{Name: "lpr", Tenant: "acme", Resolve: resolver}),
+		"a receiver with a path and a mount":      receiver(webhook.Receiver{Name: "lpr", Resolve: resolver, Path: "lpr/{key}", Mount: "/lpr/{key}"}),
+		"a path that starts with a slash":         receiver(webhook.Receiver{Name: "lpr", Resolve: resolver, Path: "/lpr/{key}"}),
+		"a mount that is relative":                receiver(webhook.Receiver{Name: "lpr", Resolve: resolver, Mount: "lpr/{key}"}),
+		"a mount in the framework's namespace":    receiver(webhook.Receiver{Name: "lpr", Resolve: resolver, Mount: "/_arandu/lpr"}),
+		"a path that is not a pattern":            receiver(webhook.Receiver{Name: "lpr", Resolve: resolver, Path: "lpr/{key"}),
+		"a refusal that is not one":               receiver(webhook.Receiver{Name: "lpr", Resolve: resolver, Statuses: webhook.Statuses{Unresolved: 200}}),
+		"both processors": receiver(webhook.Receiver{Name: "lpr", Resolve: resolver,
+			ProcessSync: webhook.SyncProcessorFunc(func(context.Context, security.Grant, *webhook.Call) (webhook.ProcessResult, error) {
+				return webhook.ProcessResult{}, nil
+			})}),
+		"two receivers at one address": {Key: key, Receivers: []webhook.Receiver{
+			{Name: "first", Tenant: "acme", Secret: testKey, Process: process, Path: "shared"},
+			{Name: "second", Tenant: "acme", Secret: testKey, Process: process, Mount: "/webhooks/shared"},
+		}},
 		"a receiver twice": {Key: key, Receivers: []webhook.Receiver{
 			{Name: "billing", Tenant: "acme", Secret: testKey, Process: process},
 			{Name: "billing", Tenant: "acme", Secret: testKey, Process: process},

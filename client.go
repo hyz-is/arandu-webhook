@@ -3,12 +3,15 @@ package webhook
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/arandu-io/framework/data"
 	"github.com/arandu-io/framework/security"
+	"github.com/arandu-io/hesape/auth"
 	"github.com/arandu-io/hesape/queue"
 	"github.com/arandu-io/hesape/queue/jobs"
 	hwebhook "github.com/arandu-io/hesape/webhook"
@@ -34,6 +37,67 @@ type ProcessorFunc func(ctx context.Context, g security.Grant, call *Call) error
 func (f ProcessorFunc) Process(ctx context.Context, g security.Grant, call *Call) error {
 	return f(ctx, g, call)
 }
+
+// SyncProcessor handles a stored call before the sender is answered, and
+// says what to answer. g is the Grant of the call's tenant. An error leaves
+// the call failed and answers Statuses.Failed; a result of 400 or above
+// leaves it failed too, with the status as its message, and is answered as
+// it is.
+type SyncProcessor interface {
+	ProcessNow(ctx context.Context, g security.Grant, call *Call) (ProcessResult, error)
+}
+
+// SyncProcessorFunc adapts a function to SyncProcessor.
+type SyncProcessorFunc func(ctx context.Context, g security.Grant, call *Call) (ProcessResult, error)
+
+// ProcessNow calls f.
+func (f SyncProcessorFunc) ProcessNow(ctx context.Context, g security.Grant, call *Call) (ProcessResult, error) {
+	return f(ctx, g, call)
+}
+
+// ProcessResult is the answer a SyncProcessor gives the sender.
+type ProcessResult struct {
+	// Status is the answer's status. Zero means 200.
+	Status int
+	// Body is the answer's body, sent as it is; nil sends none.
+	Body []byte
+	// ContentType is the body's type. Empty means application/json when
+	// there is a body.
+	ContentType string
+}
+
+// Resolution is the record a request to a dynamic receiver is addressed to.
+type Resolution struct {
+	// Tenant is the record's tenant: whose call this is.
+	Tenant string
+	// Secret and PreviousSecrets are the record's signing secrets, the
+	// previous ones still accepted during a rotation.
+	Secret          string
+	PreviousSecrets []string
+	// Validator checks this record's calls. Nil means the receiver's.
+	Validator SignatureValidator
+	// Reference is kept on the call as Call.Reference, for the processor to
+	// find the record again: an id, never a secret.
+	Reference string
+}
+
+// Resolver finds the record a request to a dynamic receiver is addressed to.
+// It reads the path with r.PathValue and nothing of the body, and answers an
+// error when there is no such record, or it is not one that takes calls.
+type Resolver interface {
+	Resolve(r *http.Request) (Resolution, error)
+}
+
+// ResolverFunc adapts a function to Resolver.
+type ResolverFunc func(r *http.Request) (Resolution, error)
+
+// Resolve calls f.
+func (f ResolverFunc) Resolve(r *http.Request) (Resolution, error) { return f(r) }
+
+// ErrReceiverUnavailable is what a Resolver wraps when it cannot answer now
+// -- what it reads from is not wired or not reachable -- rather than when the
+// record does not exist. It answers Statuses.Unavailable.
+var ErrReceiverUnavailable = errors.New("webhook: the receiver cannot resolve calls right now")
 
 // Profile decides whether a call whose signature checked is stored and
 // processed: webhook-client's WebhookProfile. A call it turns down is
@@ -135,37 +199,169 @@ func newClient(db *data.DB, cfg Config, audit *auditor) *client {
 	return c
 }
 
-// receive is webhook-client's WebhookProcessor: the signature, the profile,
-// the stored call and its queued processing, the answer.
+// refusal is a receiver's answer to a call it does not take.
+func refusal(status int, text string) error { return statusError{status: status, text: text} }
+
+// addressed is who a call is for and what signs it: the receiver's own, or
+// the record Resolve found.
+type addressed struct {
+	tenant    string
+	secrets   hwebhook.SecretSet
+	validator SignatureValidator
+	reference string
+}
+
+// address resolves the record a request is for. A static receiver is its
+// own record.
+func (c *client) address(r *http.Request, rc *receiver) (addressed, error) {
+	if rc.Resolve == nil {
+		return addressed{tenant: rc.Tenant, secrets: rc.secrets, validator: rc.Validator}, nil
+	}
+	found, err := rc.Resolve.Resolve(r)
+	switch {
+	case errors.Is(err, ErrReceiverUnavailable):
+		return addressed{}, refusal(rc.Statuses.Unavailable, "webhook: the receiver is not available")
+	case err != nil || !auth.ValidTenant(found.Tenant):
+		return addressed{}, refusal(rc.Statuses.Unresolved, "webhook: no record takes this call")
+	}
+	out := addressed{tenant: found.Tenant, validator: rc.Validator, reference: found.Reference,
+		secrets: hwebhook.SecretSet{Current: []byte(found.Secret)}}
+	for _, previous := range found.PreviousSecrets {
+		out.secrets.Previous = append(out.secrets.Previous, []byte(previous))
+	}
+	if found.Validator != nil {
+		out.validator = found.Validator
+	}
+	return out, nil
+}
+
+// receive is webhook-client's WebhookProcessor: the record the call is
+// addressed to, the signature, the profile, the stored call and its
+// processing, the answer. A validator that reads only headers is asked
+// before the body is read, so a call it refuses is refused whatever its body.
 func (c *client) receive(w http.ResponseWriter, r *http.Request, rc *receiver) error {
-	body, err := io.ReadAll(io.LimitReader(r.Body, rc.MaxBodyBytes+1))
+	to, err := c.address(r, rc)
 	if err != nil {
 		return err
 	}
-	if int64(len(body)) > rc.MaxBodyBytes {
-		return ErrBodyTooLarge
-	}
-	if !rc.Validator.Valid(r, body, rc.secrets) {
+	invalid := func() error {
 		if rc.OnInvalidSignature != nil {
 			rc.OnInvalidSignature(r, rc.Name)
 		}
-		return ErrInvalidSignature
+		if rc.Statuses.InvalidSignature == ErrInvalidSignature.status {
+			return ErrInvalidSignature
+		}
+		return refusal(rc.Statuses.InvalidSignature, ErrInvalidSignature.text)
+	}
+	checked := false
+	if headers, ok := to.validator.(headerValidator); ok && headers.readsHeadersOnly() {
+		if !to.validator.Valid(r, nil, to.secrets) {
+			return invalid()
+		}
+		checked = true
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, rc.MaxBodyBytes+1))
+	if err != nil {
+		return refusal(rc.Statuses.BadRequest, "webhook: the body could not be read")
+	}
+	if len(body) == 0 && rc.ReencodeForm && isForm(r) {
+		if r.PostForm == nil {
+			if err := r.ParseForm(); err != nil {
+				return refusal(rc.Statuses.BadRequest, "webhook: the form could not be read")
+			}
+		}
+		body = []byte(r.PostForm.Encode())
+	}
+	if int64(len(body)) > rc.MaxBodyBytes {
+		if rc.Statuses.TooLarge == ErrBodyTooLarge.status {
+			return ErrBodyTooLarge
+		}
+		return refusal(rc.Statuses.TooLarge, ErrBodyTooLarge.text)
+	}
+	if !checked && !to.validator.Valid(r, body, to.secrets) {
+		return invalid()
+	}
+	if len(body) == 0 && rc.Statuses.EmptyBody != 0 {
+		return refusal(rc.Statuses.EmptyBody, "webhook: the call has no body")
 	}
 	if !rc.Profile.ShouldProcess(r, body) {
+		if rc.ProcessSync != nil {
+			w.WriteHeader(http.StatusOK)
+			return nil
+		}
 		return rc.Respond.Respond(w, r, nil)
 	}
-	call, err := c.store(r.Context(), r, rc, body)
+	if rc.ProcessSync != nil {
+		return c.processNow(w, r, rc, to, body)
+	}
+	call, err := c.store(r.Context(), r, rc, to, body, true)
 	if err != nil {
 		return err
 	}
 	return rc.Respond.Respond(w, r, call)
 }
 
-// store keeps the call and queues its processing, in one transaction: a call
-// is never stored without its job, nor queued without its row.
-func (c *client) store(ctx context.Context, r *http.Request, rc *receiver, body []byte) (*Call, error) {
-	//arandu:system-grant the signature checked against the secret the application configured for this receiver, and the tenant is the receiver's, from Config; nothing in the request chose it.
-	g := security.SystemGrant(CallReceive, rc.Tenant)
+// isForm reports whether the request says its body is a form.
+func isForm(r *http.Request) bool {
+	return strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/x-www-form-urlencoded")
+}
+
+// processNow stores the call, runs the receiver's SyncProcessor on it, keeps
+// the outcome, and answers what the processor said.
+func (c *client) processNow(w http.ResponseWriter, r *http.Request, rc *receiver, to addressed, body []byte) error {
+	call, err := c.store(r.Context(), r, rc, to, body, false)
+	if err != nil {
+		return err
+	}
+	result, failure := c.runSync(r.Context(), rc, call)
+	if failure != nil {
+		return refusal(rc.Statuses.Failed, "webhook: the call could not be processed")
+	}
+	status := result.Status
+	if status == 0 {
+		status = http.StatusOK
+	}
+	if result.Body != nil {
+		kind := result.ContentType
+		if kind == "" {
+			kind = "application/json"
+		}
+		w.Header().Set("Content-Type", kind)
+	}
+	w.WriteHeader(status)
+	if result.Body != nil {
+		_, err = w.Write(result.Body)
+	}
+	return err
+}
+
+// runSync runs a SyncProcessor on a stored call and keeps its outcome on the
+// call. The error is the processing's, or the call's own save.
+func (c *client) runSync(ctx context.Context, rc *receiver, call *Call) (ProcessResult, error) {
+	//arandu:system-grant the call was stored in the tenant its receiver or its resolved record names; its processing runs there.
+	g := security.SystemGrant(CallReceive, call.TenantID)
+	call.Attempts++
+	result, failure := rc.ProcessSync.ProcessNow(ctx, g, call)
+	switch {
+	case failure != nil:
+		call.Failed(failure, c.now())
+	case result.Status >= http.StatusBadRequest:
+		call.Failed(fmt.Errorf("webhook: the processor answered %d", result.Status), c.now())
+	default:
+		call.Processed(c.now())
+	}
+	if _, err := call.Save(ctx, g); err != nil {
+		return result, errors.Join(failure, err)
+	}
+	return result, failure
+}
+
+// store keeps the call and, when queued, its processing, in one
+// transaction: a call is never stored without its job, nor queued without
+// its row.
+func (c *client) store(ctx context.Context, r *http.Request, rc *receiver, to addressed, body []byte, queued bool) (*Call, error) {
+	//arandu:system-grant the signature checked against the secret the application configured for this receiver, or for the record its Resolve found, and the tenant is that receiver's or that record's; nothing in the request chose it.
+	g := security.SystemGrant(CallReceive, to.tenant)
 	call, err := Calls(c.db).New()
 	if err != nil {
 		return nil, err
@@ -174,12 +370,15 @@ func (c *client) store(ctx context.Context, r *http.Request, rc *receiver, body 
 		return nil, err
 	}
 	now := c.now()
-	call.TenantID, call.Name, call.Method = data.Tenant(g), rc.Name, r.Method
+	call.TenantID, call.Name, call.Method, call.Reference = data.Tenant(g), rc.Name, r.Method, to.reference
 	call.URL, call.HeaderData, call.Payload = requestURL(r), keptHeaders(r.Header, rc.StoreHeaders), string(body)
 	call.Status, call.ProcessedAt, call.CreatedAt, call.UpdatedAt = CallReceived, now, now, now
 	err = data.Transaction(ctx, c.db, func(ctx context.Context) error {
 		if _, err := call.Save(ctx, g); err != nil {
 			return err
+		}
+		if !queued {
+			return nil
 		}
 		return c.enqueue(ctx, rc, call)
 	})
@@ -237,6 +436,11 @@ func (c *client) handle(ctx context.Context, g security.Grant, j *jobs.Job) erro
 	rc, ok := c.receivers[call.Name]
 	if !ok {
 		return errors.New("webhook: no receiver named " + call.Name + " is configured any more")
+	}
+	if rc.Process == nil {
+		// A call of a synchronous receiver, sent to its processor again.
+		_, failure := c.runSync(ctx, rc, call)
+		return failure
 	}
 	call.Attempts++
 	failure := rc.Process.Process(ctx, g, call)

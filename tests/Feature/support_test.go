@@ -88,7 +88,7 @@ func install(t *testing.T, configure func(*webhook.Config, *handled)) *world {
 		configure(&cfg, h)
 	}
 	for i := range cfg.Receivers {
-		if cfg.Receivers[i].Process == nil {
+		if cfg.Receivers[i].Process == nil && cfg.Receivers[i].ProcessSync == nil {
 			cfg.Receivers[i].Process = h
 		}
 	}

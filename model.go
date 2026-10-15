@@ -82,6 +82,9 @@ type Call struct {
 
 	// Name is the receiver it arrived at.
 	Name string `db:"name"`
+	// Reference is what the receiver's Resolve said the call is for -- the
+	// record the processor finds again -- and empty for a static receiver.
+	Reference string `db:"reference"`
 	// Method and URL are how it arrived.
 	Method string `db:"method"`
 	URL    string `db:"url"`
@@ -552,7 +555,7 @@ func (r CallResource) ToArray() map[string]any {
 		return map[string]any{}
 	}
 	out := map[string]any{
-		"id": r.c.ID, "name": r.c.Name, "method": r.c.Method, "url": r.c.URL,
+		"id": r.c.ID, "name": r.c.Name, "reference": r.c.Reference, "method": r.c.Method, "url": r.c.URL,
 		"headers": r.c.Headers(), "payload": r.c.Payload, "status": string(r.c.Status),
 		"attempts": r.c.Attempts, "exception": r.c.Exception,
 		"created_at": r.c.CreatedAt.UTC().Format(time.RFC3339),

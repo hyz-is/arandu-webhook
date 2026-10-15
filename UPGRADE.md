@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## v0.3.0
+
+Nothing to rewrite: every field added is optional, and a receiver configured
+for v0.2.0 answers as it did -- 403 for an invalid signature, 413 for a body too
+large, any body accepted -- except that a body that cannot be read answers 400
+instead of 500.
+
+Before deploying, run `aru migrate`:
+`20261015_0006_add_reference_to_webhook_client_calls` adds a column with a
+default to `webhook_client_calls`.
+
+The clean of received calls, `webhook.calls.clean`, is now a per-tenant task:
+the scheduler runs it in every active tenant with that tenant's Grant, instead
+of once in the tenants the receivers name.
+
+A receiver with `Mount` answers outside `ReceivePrefix`: exempt it from the
+CSRF check with `middleware.CSRFExcept(webhookModule.ReceivePaths()...)` in
+place of `CSRFExcept(webhookModule.ReceivePrefix()+"/")`.
+
+
 ## v0.2.0
 
 The module requires hesape v0.56.0, not v0.58.0. An application that went to

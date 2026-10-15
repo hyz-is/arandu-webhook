@@ -157,15 +157,43 @@ type Server struct {
 }
 
 // Receiver is one system that calls this application: webhook-client's
-// config entry, mounted at ReceivePrefix + "/" + Name.
+// config entry, mounted at ReceivePrefix + "/" + Name unless Path or Mount
+// says otherwise.
+//
+// A receiver is static -- one Tenant and one Secret from the configuration --
+// or dynamic: Resolve finds the record a request is addressed to, and the
+// record says whose call it is and which secrets sign it. Either way nothing
+// in the request chooses the tenant. A path parameter only says which record
+// to look for, and the signature checked against that record's secrets is
+// what admits the call.
 type Receiver struct {
 	// Name identifies the receiver, its route and its calls: lowercase
 	// letters, digits and dashes.
 	Name string
 
-	// Tenant is whose calls these are. It comes from the application's
-	// configuration, never from the request.
+	// Path is where the receiver answers under ReceivePrefix, and may carry
+	// path parameters for Resolve to read with r.PathValue: "cielo/{token}"
+	// answers at /webhooks/cielo/{token}. Empty means Name.
+	Path string
+
+	// Mount is an absolute path the receiver answers at instead, outside
+	// ReceivePrefix, for an address that is already published:
+	// "/integracoes/lpr/{org}/{key}". It cannot be under /_arandu. The
+	// application exempts it from the CSRF check too; ReceivePaths lists
+	// what to exempt.
+	Mount string
+
+	// Tenant is whose calls these are, for a static receiver. It comes from
+	// the application's configuration, never from the request. A receiver
+	// with Resolve leaves it empty.
 	Tenant string
+
+	// Resolve finds the record a request is addressed to, before anything is
+	// read of its body: its tenant, the secrets that sign its calls, a
+	// validator of its own when it needs one, and a reference the call keeps
+	// for the processor. An error answers Statuses.Unresolved, or
+	// Statuses.Unavailable when it wraps ErrReceiverUnavailable.
+	Resolve Resolver
 
 	// Methods are the HTTP methods accepted. Empty means POST.
 	Methods []string
@@ -192,8 +220,23 @@ type Receiver struct {
 	StoreHeaders []string
 
 	// Process handles a stored call on the queue: webhook-client's
-	// process_webhook_job. Required.
+	// process_webhook_job. Required unless ProcessSync is set.
 	Process Processor
+
+	// ProcessSync handles a stored call before the sender is answered, and
+	// its result is the answer: the status and the body. The call is still
+	// stored, and its outcome kept on it. Set it instead of Process for a
+	// sender that needs to know what became of its call.
+	ProcessSync SyncProcessor
+
+	// ReencodeForm takes a form-encoded call whose raw body is empty -- read
+	// already by something that parsed the form -- as the form encoded
+	// again.
+	ReencodeForm bool
+
+	// Statuses are what each refusal answers. A zero field keeps its
+	// default.
+	Statuses Statuses
 
 	// Tries is how many times a call is processed before it stays failed.
 	// Zero means DefaultTries.
@@ -268,15 +311,122 @@ func (c Config) Validate() error {
 		}
 		seen[r.Name] = true
 	}
+	return validateReceiverRoutes(c)
+}
+
+// reservedPrefix is the namespace the framework keeps for itself.
+const reservedPrefix = "/_arandu"
+
+// validateReceiverRoutes registers every receiver's pattern on a throwaway
+// mux, which refuses a pattern it cannot parse and two that conflict -- by
+// panicking, which is turned into the error New promises.
+func validateReceiverRoutes(c Config) (err error) {
+	prefix := c.ReceivePrefix
+	if prefix == "" {
+		prefix = DefaultReceivePrefix
+	}
+	current := ""
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("webhook: the receiver %q cannot be registered at its path: %v", current, recovered)
+		}
+	}()
+	mux := http.NewServeMux()
+	for _, r := range c.Receivers {
+		current = r.Name
+		methods := r.Methods
+		if len(methods) == 0 {
+			methods = []string{http.MethodPost}
+		}
+		for _, method := range methods {
+			mux.Handle(strings.ToUpper(method)+" "+r.route(prefix), http.NotFoundHandler())
+		}
+	}
 	return nil
+}
+
+// route is the path the receiver answers at.
+func (r Receiver) route(receivePrefix string) string {
+	switch {
+	case r.Mount != "":
+		return r.Mount
+	case r.Path != "":
+		return receivePrefix + "/" + r.Path
+	}
+	return receivePrefix + "/" + r.Name
+}
+
+// Statuses are what a receiver answers each refusal with. A zero field keeps
+// its default, which is what a receiver answered before it could be chosen.
+type Statuses struct {
+	// Unresolved is a request Resolve found no record for. Default 404.
+	Unresolved int
+	// InvalidSignature is a call whose signature does not check. Default 403.
+	InvalidSignature int
+	// EmptyBody is a call with no body. Zero accepts one.
+	EmptyBody int
+	// TooLarge is a body above MaxBodyBytes. Default 413.
+	TooLarge int
+	// BadRequest is a body that could not be read. Default 400.
+	BadRequest int
+	// Unavailable is a Resolve that answered ErrReceiverUnavailable. Default
+	// 503.
+	Unavailable int
+	// Failed is a ProcessSync that answered an error. Default 500.
+	Failed int
+}
+
+// The default statuses of a receiver's refusals.
+const (
+	DefaultUnresolvedStatus       = http.StatusNotFound
+	DefaultInvalidSignatureStatus = http.StatusForbidden
+	DefaultTooLargeStatus         = http.StatusRequestEntityTooLarge
+	DefaultBadRequestStatus       = http.StatusBadRequest
+	DefaultUnavailableStatus      = http.StatusServiceUnavailable
+	DefaultFailedStatus           = http.StatusInternalServerError
+)
+
+func (s Statuses) withDefaults() Statuses {
+	pick := func(value, fallback int) int {
+		if value == 0 {
+			return fallback
+		}
+		return value
+	}
+	s.Unresolved = pick(s.Unresolved, DefaultUnresolvedStatus)
+	s.InvalidSignature = pick(s.InvalidSignature, DefaultInvalidSignatureStatus)
+	s.TooLarge = pick(s.TooLarge, DefaultTooLargeStatus)
+	s.BadRequest = pick(s.BadRequest, DefaultBadRequestStatus)
+	s.Unavailable = pick(s.Unavailable, DefaultUnavailableStatus)
+	s.Failed = pick(s.Failed, DefaultFailedStatus)
+	return s
 }
 
 func (r Receiver) validate() error {
 	if !namePattern.MatchString(r.Name) {
 		return fmt.Errorf("Name %q: use lowercase letters, digits and dashes", r.Name)
 	}
-	if !auth.ValidTenant(r.Tenant) {
-		return fmt.Errorf("receiver %q has no valid Tenant: name whose calls these are", r.Name)
+	if r.Resolve == nil && !auth.ValidTenant(r.Tenant) {
+		return fmt.Errorf("receiver %q has no valid Tenant: name whose calls these are, or Resolve them", r.Name)
+	}
+	if r.Resolve != nil && r.Tenant != "" {
+		return fmt.Errorf("receiver %q has a Tenant and a Resolve: the tenant is the resolved record's", r.Name)
+	}
+	if r.Path != "" && r.Mount != "" {
+		return fmt.Errorf("receiver %q has a Path and a Mount: it answers at one address", r.Name)
+	}
+	if r.Path != "" && (strings.HasPrefix(r.Path, "/") || strings.HasSuffix(r.Path, "/")) {
+		return fmt.Errorf("receiver %q: Path %q is relative to ReceivePrefix, with no slash at either end", r.Name, r.Path)
+	}
+	if r.Mount != "" && (!strings.HasPrefix(r.Mount, "/") || strings.HasSuffix(r.Mount, "/") ||
+		r.Mount == reservedPrefix || strings.HasPrefix(r.Mount, reservedPrefix+"/")) {
+		return fmt.Errorf("receiver %q: Mount %q is an absolute path, not ending in / and not under %s", r.Name, r.Mount, reservedPrefix)
+	}
+	for _, status := range []int{r.Statuses.Unresolved, r.Statuses.InvalidSignature, r.Statuses.EmptyBody,
+		r.Statuses.TooLarge, r.Statuses.Unavailable, r.Statuses.Failed, r.Statuses.BadRequest} {
+		if status != 0 && (status < 400 || status > 599) {
+			return fmt.Errorf("receiver %q: a refusal answers a 4xx or 5xx status, not %d", r.Name, status)
+		}
 	}
 	for _, m := range r.Methods {
 		switch strings.ToUpper(m) {
@@ -285,11 +435,14 @@ func (r Receiver) validate() error {
 			return fmt.Errorf("receiver %q: %q is not a method a webhook arrives with", r.Name, m)
 		}
 	}
-	if r.Validator == nil && len(r.Secret) == 0 {
+	if r.Resolve == nil && r.Validator == nil && len(r.Secret) == 0 {
 		return fmt.Errorf("receiver %q has no Secret: a call nobody signed is not accepted", r.Name)
 	}
-	if r.Process == nil {
-		return fmt.Errorf("receiver %q has no Process: name what handles its calls", r.Name)
+	if (r.Process == nil) == (r.ProcessSync == nil) {
+		return fmt.Errorf("receiver %q needs one of Process and ProcessSync: name what handles its calls", r.Name)
+	}
+	if r.ProcessSync != nil && r.Respond != nil {
+		return fmt.Errorf("receiver %q has a Respond and a ProcessSync: the processor's result is the answer", r.Name)
 	}
 	if r.Tries < 0 || r.MaxBodyBytes < 0 {
 		return fmt.Errorf("receiver %q: Tries and MaxBodyBytes cannot be negative", r.Name)
@@ -369,9 +522,10 @@ func (c Config) withDefaults() Config {
 		if r.Profile == nil {
 			r.Profile = ProcessEverything{}
 		}
-		if r.Respond == nil {
+		if r.Respond == nil && r.ProcessSync == nil {
 			r.Respond = RespondOK{}
 		}
+		r.Statuses = r.Statuses.withDefaults()
 		if r.Tries == 0 {
 			r.Tries = DefaultTries
 		}

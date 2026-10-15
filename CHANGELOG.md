@@ -10,6 +10,53 @@ a release is corrected by another release and never by moving a tag.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-15
+
+The receiving side takes calls addressed to records of the application, at
+the addresses those calls already use.
+
+### Added
+
+- Dynamic receivers. `Receiver.Resolve` (a `Resolver`, `ResolverFunc`) finds
+  the record a request is addressed to from its path, before the body is read:
+  a `Resolution` with the record's tenant, its `Secret` and `PreviousSecrets`,
+  an optional `Validator` of its own and a `Reference` the call keeps as
+  `Call.Reference`. The tenant is the record's: a path parameter only says
+  which record to look for, and the signature checked against its secrets
+  admits the call. `ErrReceiverUnavailable` answers 503.
+- `Receiver.Path`, a pattern under `ReceivePrefix` with path parameters
+  (`"cielo/{token}"`), and `Receiver.Mount`, an absolute address outside it
+  (`"/integracoes/lpr/{org}/{key}"`), so a receiver keeps a URL already
+  published. `Module.ReceivePaths` lists the prefixes to exempt from CSRF.
+- `HeaderSecret{Header}`, a shared secret sent as it is, compared in constant
+  time with every accepted secret, refusing every call when there is none and
+  checked before the body is read; and `StandardWebhooks{Tolerance, Now}`, the
+  Standard Webhooks scheme, accepting any `v1` signature under the current or a
+  previous secret within five minutes.
+- `Receiver.Statuses` (`Statuses`): what an unresolved request, an invalid
+  signature, an empty body, a body too large, a body that cannot be read, an
+  unavailable resolver and a failed synchronous processing answer, with the
+  defaults `DefaultUnresolvedStatus`, `DefaultInvalidSignatureStatus`,
+  `DefaultTooLargeStatus`, `DefaultBadRequestStatus`,
+  `DefaultUnavailableStatus` and `DefaultFailedStatus`. An empty body is still
+  accepted unless `EmptyBody` is set.
+- `Receiver.ReencodeForm`: a form whose raw body was already read is taken as
+  the form encoded again.
+- `Receiver.ProcessSync` (`SyncProcessor`, `SyncProcessorFunc`,
+  `ProcessResult`): the call is stored, processed before the sender is
+  answered, and the processor's status and body are the answer; the outcome is
+  kept on the call, and `CallService.Process` processes it again on the queue.
+- The migration `20261015_0006_add_reference_to_webhook_client_calls`.
+
+### Changed
+
+- A body that cannot be read answers 400 (`Statuses.BadRequest`) instead of
+  500.
+- `webhook.calls.clean` runs per tenant, as `webhook.deliveries.clean` does,
+  because a receiver with `Resolve` takes calls for any tenant.
+- A received call's resource answers its `reference`.
+
+
 ## [0.2.0] - 2026-10-14
 
 The module owns its outbound delivery. hesape/webhook's Manager is no longer
